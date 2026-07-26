@@ -1,0 +1,60 @@
+[package]
+name = "anime-tui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv"
+license = "MIT"
+default-run = "anime-tui"
+
+[[bin]]
+name = "anime-tui"
+path = "src/main.rs"
+
+# Proof-of-concept: validates the mpv --vo=kitty embedded-playback pipeline.
+# Run inside a Kitty-graphics-capable terminal (Kitty, Ghostty, WezTerm):
+#   cargo run --bin poc_kitty -- /path/to/local.mp4
+[[bin]]
+name = "poc_kitty"
+path = "src/bin/poc_kitty.rs"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync", "fs", "io-util", "signal"] }
+futures = "0.3"
+
+# HTTP + scraping (provider layer)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies", "gzip", "brotli"] }
+scraper = "0.21"
+url = "2"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Errors / logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+directories = "5"
+async-trait = "0.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = true

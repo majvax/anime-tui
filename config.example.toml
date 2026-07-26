@@ -1,0 +1,35 @@
+# anime-tui example configuration.
+# Copy to the platform config dir (printed by `anime-tui`) as config.toml.
+
+# Provider host. Defaults to nakanime.tv; set to "" to use the offline mock.
+base_url = "https://nakanime.tv"
+
+# mpv binary. Spawned with a structured argument array, never through a shell.
+mpv_path = "mpv"
+
+# Playback backend. Default (false) is a standalone mpv window: highest quality
+# (best video+audio via yt-dlp) and no terminal image-cache RAM. Set to true to
+# opt in to embedded in-terminal (Kitty) playback — only takes effect in a
+# Kitty-graphics terminal, and note it makes the terminal cache every frame as an
+# uncompressed bitmap (GB-range RAM). You can also press `o` during embedded
+# playback to jump to a window on the fly.
+embedded_player = false
+
+# Cache location for posters/metadata. Omit to use the platform cache dir.
+# cache_dir = "/home/you/.cache/anime-tui"
+
+# Seconds between periodic playback-progress saves.
+progress_save_interval_secs = 10
+
+[network]
+timeout_secs = 20
+max_retries = 2
+user_agent = "anime-tui/0.1.0"
+
+[playback]
+# Bound mpv's own read-ahead buffer so a long stream doesn't sit in RAM.
+max_buffer_mib = 64
+readahead_secs = 10
+
+# Seconds the `i` key jumps forward to skip an opening (typical anime OP ≈ 90 s).
+skip_intro_secs = 85
