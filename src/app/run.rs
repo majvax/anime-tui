@@ -1082,11 +1082,10 @@ impl Runner {
                 return;
             };
             self.playback_attempt += 1;
-            if idx > 0 {
-                // A previous candidate failed — tell the user what we're trying now.
-                let host = source.label.clone().unwrap_or_else(|| "next source".into());
-                self.app.set_status(format!("trying source {host}…"));
-            }
+            // Resolve the host embed to a FRESH direct URL now (its token is short-
+            // lived, so this must happen at play time, not at prefetch/cache time).
+            let client = self.http.clone();
+            let source = resolve_host_source(&client, source).await;
             if self.begin_playback(anime.clone(), episode.clone(), source).await {
                 return; // running (embedded) or spawned (external)
             }
@@ -1667,12 +1666,12 @@ async fn resolve_and_prepare(
     if std::env::var_os("ANIME_TUI_DUMP").is_some() {
         dump_embed_pages(client, &sources).await;
     }
-    // Resolve host-specific embeds concurrently; failures leave the source unchanged
-    // (mpv's ytdl hook then gets a chance at the embed URL).
-    Ok(futures::future::join_all(
-        sources.into_iter().map(|s| resolve_host_source(client, s)),
-    )
-    .await)
+    // NOTE: we deliberately do NOT resolve host embeds here. Those direct URLs carry
+    // time-limited tokens; resolving now (and caching via prefetch) would replay an
+    // expired token later ("works, then fails, then works"). We keep the stable embed
+    // URLs and resolve the chosen one to a fresh direct URL at play time
+    // (`advance_playback` → `resolve_host_source`).
+    Ok(sources)
 }
 
 /// Save each source's embed URL + fetched HTML under `<tmp>/anime-tui-dump/` for
