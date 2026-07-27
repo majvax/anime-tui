@@ -81,11 +81,112 @@ pub fn find_media_url(text: &str) -> Option<String> {
     (url.starts_with("http") && (url.contains(".m3u8") || url.contains(".mp4"))).then_some(url)
 }
 
-/// Extract the direct stream from a vidmoly embed page. Vidmoly serves an HLS
-/// playlist referenced as `sources:[{file:"…​.m3u8"}]`; the CDN needs a vidmoly
-/// `Referer`. Returns the m3u8 URL (the caller supplies the Referer).
+/// Direct media URL from a player embed page: the plain `sources:[{file:"…"}]` URL
+/// if present, else the one hidden inside p.a.c.k.e.r-packed JS. Covers the many
+/// jwplayer-style hosts (vidmoly, lulustream/luluvdo, smoothpre, vidzy, …).
+pub fn packed_stream_url(html: &str) -> Option<String> {
+    if let Some(u) = find_media_url(html) {
+        return Some(u);
+    }
+    let start = html.find("eval(function(p,a,c,k,e,d)")?;
+    let unpacked = unpack_packed_js(&html[start..])?;
+    find_media_url(&unpacked)
+}
+
+/// Kept for the vidmoly host wiring; same behaviour as [`packed_stream_url`].
 pub fn vidmoly_stream_url(html: &str) -> Option<String> {
-    find_media_url(html)
+    packed_stream_url(html)
+}
+
+/// Unpack Dean Edwards' p.a.c.k.e.r output:
+/// `}('payload', radix, count, 'k1|k2|…'.split('|'))`. Each base-`radix` token in the
+/// payload is replaced by its keyword. Returns the decoded JS, or `None` if `src`
+/// isn't packer output.
+pub fn unpack_packed_js(src: &str) -> Option<String> {
+    let sp = src.find(".split('|')").or_else(|| src.find(".split(\"|\")"))?;
+    let call = src[..sp].rfind("}(")?;
+    let args = &src[call + 2..sp];
+    let bytes = args.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    // Payload: the first quoted string, decoding backslash escapes.
+    let mut payload = String::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => {
+                payload.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            c if c == quote => {
+                i += 1;
+                break;
+            }
+            c => {
+                payload.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    let rest = &args[i..];
+    let radix: u32 = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())?
+        .parse()
+        .ok()?;
+    // Keywords: between the first and last quote of the remaining args.
+    let kwo = rest.find(['\'', '"'])?;
+    let kwc = rest.rfind(['\'', '"'])?;
+    if kwc <= kwo {
+        return None;
+    }
+    let keywords: Vec<&str> = rest[kwo + 1..kwc].split('|').collect();
+    // p.a.c.k.e.r substitutes from the highest index down.
+    let mut out = payload;
+    for c in (0..keywords.len()).rev() {
+        if !keywords[c].is_empty() {
+            out = replace_word(&out, &to_base(c, radix), keywords[c]);
+        }
+    }
+    Some(out)
+}
+
+fn to_base(mut n: usize, radix: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let radix = (radix.clamp(2, 36)) as usize;
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[n % radix]);
+        n /= radix;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
+}
+
+/// Replace whole-word occurrences of `word` (bounded by non-`[A-Za-z0-9_]`) with
+/// `repl`. Payload/keywords are ASCII, so byte scanning is safe.
+fn replace_word(hay: &str, word: &str, repl: &str) -> String {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (hb, wb) = (hay.as_bytes(), word.as_bytes());
+    let mut out = String::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hb.len() {
+        let boundary_before = i == 0 || !is_word(hb[i - 1]);
+        let boundary_after = i + wb.len() >= hb.len() || !is_word(hb[i + wb.len()]);
+        if boundary_before && boundary_after && hb[i..].starts_with(wb) {
+            out.push_str(repl);
+            i += wb.len();
+        } else {
+            out.push(hb[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn rot13(bytes: &[u8]) -> Vec<u8> {
@@ -179,6 +280,25 @@ mod tests {
         let plus3: Vec<u8> = rev.iter().map(|&x| x.wrapping_add(3)).collect(); // step 4: -3
         let b = b64.encode(&plus3); // step 3: base64
         String::from_utf8(rot13(b.as_bytes())).unwrap() // step 2: rot13 (self-inverse)
+    }
+
+    #[test]
+    fn unpack_packed_js_substitutes_tokens() {
+        // }('0 1', 36, 2, 'hello|world'.split('|'))  →  "hello world"
+        let src = r"eval(function(p,a,c,k,e,d){}('0 1',36,2,'hello|world'.split('|')))";
+        assert_eq!(unpack_packed_js(src).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn packed_stream_url_finds_hls_in_packed_js() {
+        // Like real pages, the URL is assembled from separate tokens so no complete
+        // ".m3u8" exists in the raw payload. Payload `0:"1.2"` with keywords
+        // [file, https://cdn/x/master, m3u8] → `file:"https://cdn/x/master.m3u8"`.
+        let src = r#"eval(function(p,a,c,k,e,d){}('0:"1.2"',36,3,'file|https://cdn/x/master|m3u8'.split('|')))"#;
+        assert_eq!(
+            packed_stream_url(src).as_deref(),
+            Some("https://cdn/x/master.m3u8"),
+        );
     }
 
     #[test]

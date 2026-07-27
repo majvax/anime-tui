@@ -1710,11 +1710,21 @@ async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) ->
                 s.headers = referer(&format!("{}/", crate::resolver::SIBNET_BASE));
             }
         }
-    } else if host_is("vidmoly") {
+    } else if host_is("vidmoly")
+        || host_is("lulustream")
+        || host_is("luluvdo")
+        || host_is("smoothpre")
+        || host_is("vidzy")
+    {
+        // jwplayer-style hosts: the HLS URL is in the (often p.a.c.k.e.r-packed)
+        // player config. The CDN token is IP+time locked; send the embed origin.
+        let origin = origin_of(&s.url).unwrap_or_default();
         if let Some(html) = fetch_embed(client, &s.url).await {
-            if let Some(direct) = crate::resolver::vidmoly_stream_url(&html) {
+            if let Some(direct) = crate::resolver::packed_stream_url(&html) {
                 s.url = direct;
-                s.headers = referer("https://vidmoly.to/");
+                if !origin.is_empty() {
+                    s.headers = referer(&origin);
+                }
             }
         }
     } else if host_is("voe") {
