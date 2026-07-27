@@ -1719,32 +1719,58 @@ async fn dump_embed_pages(client: &reqwest::Client, sources: &[PreparedSource]) 
 }
 
 /// For hosts we support natively, fetch the embed page and rewrite the source to a
-/// direct stream URL + the required headers. Currently: **sibnet** (its yt-dlp
-/// extractor doesn't yield a playable stream here, but the site does — the direct
-/// `/v/…` mp4 just needs `Referer: video.sibnet.ru`). Unknown/other hosts pass
-/// through unchanged.
+/// direct stream URL + the required headers. yt-dlp has no voe/vidmoly extractor and
+/// its sibnet one doesn't yield a playable stream here, so we resolve them ourselves;
+/// anything else passes through unchanged for mpv's ytdl hook.
 async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) -> PreparedSource {
-    let is_sibnet = s.url.contains("sibnet.ru")
-        || s.label.as_deref().is_some_and(|l| l.to_lowercase().contains("sibnet"));
-    if is_sibnet {
-        if let Ok(resp) = client
-            .get(&s.url)
-            .header("Referer", "https://nakanime.tv/")
-            .send()
-            .await
-        {
-            if let Ok(html) = resp.text().await {
-                if let Some(direct) = crate::resolver::sibnet_direct_url(&html) {
-                    s.url = direct;
-                    s.headers = vec![(
-                        "Referer".to_string(),
-                        format!("{}/", crate::resolver::SIBNET_BASE),
-                    )];
-                }
+    let label = s.label.as_deref().unwrap_or("").to_lowercase();
+    let host_is = |name: &str| s.url.contains(name) || label.contains(name);
+
+    // (matcher, page→direct-url extractor, Referer to send for the CDN)
+    if host_is("sibnet") {
+        if let Some(html) = fetch_embed(client, &s.url).await {
+            if let Some(direct) = crate::resolver::sibnet_direct_url(&html) {
+                s.url = direct;
+                s.headers = referer(&format!("{}/", crate::resolver::SIBNET_BASE));
+            }
+        }
+    } else if host_is("vidmoly") {
+        if let Some(html) = fetch_embed(client, &s.url).await {
+            if let Some(direct) = crate::resolver::vidmoly_stream_url(&html) {
+                s.url = direct;
+                s.headers = referer("https://vidmoly.to/");
+            }
+        }
+    } else if host_is("voe") {
+        // VOE sometimes serves a thin redirect page first; follow one media hop.
+        if let Some(html) = fetch_embed(client, &s.url).await {
+            let direct = crate::resolver::voe_stream_url(&html).or_else(|| {
+                crate::resolver::find_media_url(&html)
+            });
+            if let Some(direct) = direct {
+                s.url = direct;
+                s.headers = referer("https://voe.sx/");
             }
         }
     }
     s
+}
+
+/// GET an embed page with the site Referer, returning its body (best-effort).
+async fn fetch_embed(client: &reqwest::Client, url: &str) -> Option<String> {
+    client
+        .get(url)
+        .header("Referer", "https://nakanime.tv/")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()
+}
+
+fn referer(value: &str) -> Vec<(String, String)> {
+    vec![("Referer".to_string(), value.to_string())]
 }
 
 #[cfg(test)]
