@@ -149,6 +149,9 @@ pub struct Runner {
 
     /// mpv read-ahead buffer caps (its own RAM, not the terminal image cache).
     tuning: crate::player::mpv::MpvTuning,
+    /// Path to the generated mpv input.conf that gives the external window our
+    /// keybinds (None if it couldn't be written → mpv defaults still apply).
+    input_conf_path: Option<String>,
 }
 
 impl Runner {
@@ -162,6 +165,18 @@ impl Runner {
             .unwrap_or_else(|_| std::env::temp_dir())
             .join("posters");
         let poster_cache = crate::cache::Cache::new(poster_dir)?;
+
+        // Write the mpv input.conf that mirrors our keybinds for the external
+        // window. Best-effort: on failure the window just uses mpv's defaults.
+        let input_conf_path = {
+            let dir = config.cache_dir().unwrap_or_else(|_| std::env::temp_dir());
+            let path = dir.join("mpv-input.conf");
+            let conf = crate::player::mpv::external_input_conf(config.playback.skip_intro_secs);
+            std::fs::write(&path, conf)
+                .ok()
+                .map(|_| path.to_string_lossy().into_owned())
+        };
+
         Ok(Self {
             app,
             provider,
@@ -204,6 +219,7 @@ impl Runner {
                 max_buffer_mib: config.playback.max_buffer_mib,
                 readahead_secs: config.playback.readahead_secs,
             },
+            input_conf_path,
         })
     }
 
@@ -618,8 +634,12 @@ impl Runner {
         self.app.view = View::Episodes;
         self.app.set_status("playing in external mpv window (best quality)");
 
-        let (mpv, tx, prog_tx) =
-            (self.mpv_path.clone(), self.tx.clone(), self.prog_tx.clone());
+        let (mpv, tx, prog_tx, conf) = (
+            self.mpv_path.clone(),
+            self.tx.clone(),
+            self.prog_tx.clone(),
+            self.input_conf_path.clone(),
+        );
         tokio::spawn(async move {
             // Pre-resolved direct stream → mpv skips its yt-dlp pass and opens fast.
             let result = player::run_external(
@@ -628,6 +648,7 @@ impl Runner {
                 &source.headers,
                 pos,
                 crate::player::mpv::MpvTuning::high_quality(),
+                conf,
                 prog_tx,
             )
             .await;
@@ -943,8 +964,12 @@ impl Runner {
                 }
             }
             Backend::ExternalMpv => {
-                let (mpv, tx, prog_tx) =
-                    (self.mpv_path.clone(), self.tx.clone(), self.prog_tx.clone());
+                let (mpv, tx, prog_tx, conf) = (
+                    self.mpv_path.clone(),
+                    self.tx.clone(),
+                    self.prog_tx.clone(),
+                    self.input_conf_path.clone(),
+                );
                 tokio::spawn(async move {
                     // Hand mpv the pre-resolved direct stream so it skips its own
                     // yt-dlp pass (the ~1-2 s launch delay); a generous buffer
@@ -955,6 +980,7 @@ impl Runner {
                         &source.headers,
                         resume,
                         crate::player::mpv::MpvTuning::high_quality(),
+                        conf,
                         prog_tx,
                     )
                     .await;

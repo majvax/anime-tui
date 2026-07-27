@@ -15,11 +15,41 @@ use crate::errors::{Error, Result};
 /// How mpv should present video.
 #[derive(Debug, Clone)]
 pub enum Presentation {
-    /// Standalone mpv window / default VO. The reliable fallback.
-    External,
+    /// Standalone mpv window / default VO. `input_conf` is an optional path to an
+    /// mpv `input.conf` that mirrors the TUI keybinds so the WINDOW responds to the
+    /// same keys (mpv's default bindings/mouse are kept too).
+    External { input_conf: Option<String> },
     /// Embedded Kitty output confined to `rect` cells, painting into our screen
     /// (alt-screen and terminal-clear disabled so it doesn't hijack the TUI).
     EmbeddedKitty { rect: CellRect },
+}
+
+/// Build an mpv `input.conf` that mirrors the TUI player keybinds, so the external
+/// window responds to the same keys when it's focused. `q`/`ESC` quit (returning to
+/// the TUI). Episode nav (n/p) is intentionally omitted — it needs the TUI.
+pub fn external_input_conf(skip_intro_secs: u64) -> String {
+    format!(
+        "# anime-tui: keep in sync with Runner::on_player_key\n\
+         SPACE cycle pause\n\
+         h seek -10\n\
+         LEFT seek -10\n\
+         l seek 10\n\
+         RIGHT seek 10\n\
+         , seek -5\n\
+         . seek 5\n\
+         i seek {skip_intro_secs}\n\
+         UP add volume 5\n\
+         = add volume 5\n\
+         + add volume 5\n\
+         DOWN add volume -5\n\
+         - add volume -5\n\
+         m cycle mute\n\
+         s cycle sub\n\
+         a cycle aid\n\
+         f cycle fullscreen\n\
+         q quit\n\
+         ESC quit\n"
+    )
 }
 
 /// Bounds on mpv's own read-ahead buffer so it doesn't hold large amounts of the
@@ -62,7 +92,6 @@ pub fn build_args(
         "--no-config".into(),
         "--really-quiet".into(),
         "--input-terminal=no".into(), // do not read keys from the shared tty
-        "--no-input-default-bindings".into(),
         format!("--input-ipc-server={ipc_socket}"),
         "--keep-open=no".into(),
         "--idle=no".into(),
@@ -84,13 +113,21 @@ pub fn build_args(
     args.push("--cache-pause=no".into());
 
     match presentation {
-        Presentation::External => {
+        Presentation::External { input_conf } => {
             // Standalone window. If mpv is handed a page URL (yt-dlp pre-resolution
             // failed) let its ytdl hook pick the best stream; when it already gets
             // a direct URL — the fast path — this is a harmless no-op.
             args.push("--ytdl-format=bestvideo+bestaudio/best".into());
+            // The window keeps mpv's default bindings (mouse, OSC seek bar); our
+            // conf overrides the specific keys to match the TUI.
+            if let Some(path) = input_conf {
+                args.push(format!("--input-conf={path}"));
+            }
         }
         Presentation::EmbeddedKitty { rect } => {
+            // Embedded shares the terminal and is driven purely over IPC, so it must
+            // have no key bindings of its own.
+            args.push("--no-input-default-bindings".into());
             args.push("--vo=kitty".into());
             args.push("--vo-kitty-alt-screen=no".into());
             args.push("--vo-kitty-config-clear=no".into());
@@ -157,7 +194,7 @@ mod tests {
         let a = build_args(
             "https://x/v.m3u8",
             "/tmp/s",
-            &Presentation::External,
+            &Presentation::External { input_conf: None },
             &[],
             &MpvTuning::default(),
         );
@@ -166,6 +203,41 @@ mod tests {
         // URL is last and separated by `--` so it can't be read as a flag.
         assert_eq!(a.last().unwrap(), "https://x/v.m3u8");
         assert_eq!(a[a.len() - 2], "--");
+    }
+
+    #[test]
+    fn external_window_gets_our_bindings_embedded_does_not() {
+        // External: no default-bindings suppression, and our conf when provided.
+        let ext = build_args(
+            "https://x/v",
+            "/tmp/s",
+            &Presentation::External { input_conf: Some("/tmp/anime-tui-input.conf".into()) },
+            &[],
+            &MpvTuning::default(),
+        );
+        assert!(!ext.iter().any(|s| s == "--no-input-default-bindings"));
+        assert!(ext.iter().any(|s| s == "--input-conf=/tmp/anime-tui-input.conf"));
+        // Embedded: bindings suppressed (driven over IPC), never an input-conf.
+        let rect = CellRect { left: 0, top: 0, cols: 8, rows: 8, pixel_width: None, pixel_height: None };
+        let emb = build_args(
+            "https://x/v",
+            "/tmp/s",
+            &Presentation::EmbeddedKitty { rect },
+            &[],
+            &MpvTuning::default(),
+        );
+        assert!(emb.iter().any(|s| s == "--no-input-default-bindings"));
+        assert!(!emb.iter().any(|s| s.starts_with("--input-conf")));
+    }
+
+    #[test]
+    fn external_input_conf_mirrors_tui_binds() {
+        let conf = external_input_conf(85);
+        assert!(conf.contains("SPACE cycle pause"));
+        assert!(conf.contains("l seek 10"));
+        assert!(conf.contains("h seek -10"));
+        assert!(conf.contains("i seek 85"));
+        assert!(conf.contains("q quit"));
     }
 
     #[test]
@@ -189,7 +261,7 @@ mod tests {
         let a = build_args(
             "https://x/v",
             "/tmp/s",
-            &Presentation::External,
+            &Presentation::External { input_conf: None },
             &[],
             &MpvTuning::high_quality(),
         );
@@ -210,7 +282,7 @@ mod tests {
     #[test]
     fn tuning_bounds_readahead_buffer() {
         let t = MpvTuning { max_buffer_mib: 64, readahead_secs: 8 };
-        let a = build_args("https://x/v", "/tmp/s", &Presentation::External, &[], &t);
+        let a = build_args("https://x/v", "/tmp/s", &Presentation::External { input_conf: None }, &[], &t);
         assert!(a.iter().any(|s| s == "--demuxer-max-bytes=64MiB"));
         assert!(a.iter().any(|s| s == "--demuxer-max-back-bytes=32MiB"));
         assert!(a.iter().any(|s| s == "--cache-secs=8"));
@@ -222,7 +294,7 @@ mod tests {
         let a = build_args(
             "https://x/v",
             "/tmp/s",
-            &Presentation::External,
+            &Presentation::External { input_conf: None },
             &h,
             &MpvTuning::default(),
         );

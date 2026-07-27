@@ -33,12 +33,19 @@ pub async fn run_external(
     headers: &[(String, String)],
     start_pos: f64,
     tuning: MpvTuning,
+    input_conf: Option<String>,
     progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
 ) -> Result<()> {
     // IPC socket for control/observe (only one external play at a time).
     let socket = external_socket_path();
     let _ = std::fs::remove_file(&socket);
-    let mut args = build_args(url, &socket, &Presentation::External, headers, &tuning);
+    let mut args = build_args(
+        url,
+        &socket,
+        &Presentation::External { input_conf },
+        headers,
+        &tuning,
+    );
     if start_pos > 1.0 {
         let sep = args.iter().position(|a| a == "--").unwrap_or(args.len());
         args.insert(sep, format!("--start=+{start_pos:.3}"));
@@ -90,7 +97,7 @@ impl Backend {
     pub fn presentation(self, video_rect: CellRect) -> Presentation {
         match self {
             Backend::EmbeddedKitty => Presentation::EmbeddedKitty { rect: video_rect },
-            Backend::ExternalMpv => Presentation::External,
+            Backend::ExternalMpv => Presentation::External { input_conf: None },
         }
     }
 }

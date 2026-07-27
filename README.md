@@ -83,9 +83,11 @@ standalone window by default; set `embedded_player = true` for in-terminal
 
 On a Kitty-graphics terminal (Kitty/Ghostty/WezTerm) the details page shows the
 anime's **cover art** (fetched once and cached under the cache dir). During
-playback, `i` **skips the opening** (`skip_intro_secs`, default 85 s); all player
-controls (`Space`, `h`/`l`, `,`/`.`, etc.) work for both the window and embedded
-backends.
+playback, `i` **skips the opening** (`skip_intro_secs`, default 85 s). Player
+controls (`Space`, `h`/`l`, `,`/`.`, `i`, volume, …) work from the terminal for
+both backends over IPC, and — for the standalone window — the **same keys work
+when the mpv window itself is focused** (via a generated `input.conf`). Episode
+next/prev (`n`/`p`) are terminal-only.
 
 ## Configuration
 
