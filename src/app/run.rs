@@ -235,6 +235,10 @@ impl Runner {
             last_poster_url: None,
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
+                .user_agent(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+                     Chrome/124.0 Safari/537.36",
+                )
                 .build()
                 .unwrap_or_default(),
             thumb_cache: std::collections::HashMap::new(),
@@ -880,9 +884,9 @@ impl Runner {
             let _ = self.tx.send(Msg::Resolved { anime, episode, result: Ok(sources), choose });
             return;
         }
-        let (provider, tx) = (self.provider.clone(), self.tx.clone());
+        let (provider, tx, client) = (self.provider.clone(), self.tx.clone(), self.http.clone());
         tokio::spawn(async move {
-            let result = resolve_and_prepare(&*provider, &anime, &episode).await;
+            let result = resolve_and_prepare(&client, &*provider, &anime, &episode).await;
             let _ = tx.send(Msg::Resolved { anime, episode, result, choose });
         });
     }
@@ -1329,12 +1333,12 @@ impl Runner {
         });
     }
 
-    /// Spawn a background resolve+pre-resolve for one episode, caching the result.
+    /// Spawn a background resolve for one episode, caching the result.
     fn start_prefetch(&mut self, anime: AnimeId, episode: EpisodeId) {
         self.prefetch_inflight = Some(episode.0.clone());
-        let (provider, tx) = (self.provider.clone(), self.tx.clone());
+        let (provider, tx, client) = (self.provider.clone(), self.tx.clone(), self.http.clone());
         tokio::spawn(async move {
-            let sources = resolve_and_prepare(&*provider, &anime, &episode)
+            let sources = resolve_and_prepare(&client, &*provider, &anime, &episode)
                 .await
                 .unwrap_or_default();
             let _ = tx.send(Msg::Prefetched { episode, sources });
@@ -1670,16 +1674,52 @@ async fn fetch_thumb_png(
     .map_err(|e| Error::Resolve(format!("thumb task: {e}")))?
 }
 
-/// Resolve an episode to its ordered, validated sources. The embed/provider URL is
-/// handed to mpv as-is; mpv's ytdl hook resolves the actual stream and applies the
-/// correct per-host request headers (Referer/User-Agent), which is far more robust
-/// than re-implementing that here. Used by the direct-play path and by prefetch.
+/// Resolve an episode to its ordered, validated sources. Hosts we support natively
+/// (sibnet) are turned into a direct stream + the required `Referer` here; anything
+/// else is handed to mpv's ytdl hook as the embed URL. Used by the direct-play path
+/// and by prefetch.
 async fn resolve_and_prepare(
+    client: &reqwest::Client,
     provider: &dyn Provider,
     anime: &AnimeId,
     episode: &EpisodeId,
 ) -> Result<Vec<PreparedSource>> {
-    resolve_sources(provider, anime, episode).await
+    let sources = resolve_sources(provider, anime, episode).await?;
+    // Resolve host-specific embeds concurrently; failures leave the source unchanged
+    // (mpv's ytdl hook then gets a chance at the embed URL).
+    Ok(futures::future::join_all(
+        sources.into_iter().map(|s| resolve_host_source(client, s)),
+    )
+    .await)
+}
+
+/// For hosts we support natively, fetch the embed page and rewrite the source to a
+/// direct stream URL + the required headers. Currently: **sibnet** (its yt-dlp
+/// extractor doesn't yield a playable stream here, but the site does — the direct
+/// `/v/…` mp4 just needs `Referer: video.sibnet.ru`). Unknown/other hosts pass
+/// through unchanged.
+async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) -> PreparedSource {
+    let is_sibnet = s.url.contains("sibnet.ru")
+        || s.label.as_deref().is_some_and(|l| l.to_lowercase().contains("sibnet"));
+    if is_sibnet {
+        if let Ok(resp) = client
+            .get(&s.url)
+            .header("Referer", "https://nakanime.tv/")
+            .send()
+            .await
+        {
+            if let Ok(html) = resp.text().await {
+                if let Some(direct) = crate::resolver::sibnet_direct_url(&html) {
+                    s.url = direct;
+                    s.headers = vec![(
+                        "Referer".to_string(),
+                        format!("{}/", crate::resolver::SIBNET_BASE),
+                    )];
+                }
+            }
+        }
+    }
+    s
 }
 
 #[cfg(test)]

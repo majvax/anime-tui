@@ -29,9 +29,67 @@ pub fn validate_stream_url(raw: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Host of the sibnet video CDN; direct stream paths (`/v/…`) are relative to it,
+/// and it must be sent as the `Referer` or the CDN 403s.
+pub const SIBNET_BASE: &str = "https://video.sibnet.ru";
+
+/// Extract the direct video URL from a sibnet `shell.php` embed page.
+///
+/// The page's player is initialised as `player.src([{src: "/v/xxxx/nnnn.mp4", …}])`
+/// (occasionally an absolute URL). We take the first `/v/…` path (or absolute
+/// http(s) `…/v/…` URL) and resolve it against [`SIBNET_BASE`]. Pure/fixture-tested;
+/// the HTTP fetch + `Referer` handling lives in the async layer.
+pub fn sibnet_direct_url(html: &str) -> Option<String> {
+    // Find the first quoted string containing "/v/" …
+    let marker = "/v/";
+    let anchor = html.find(marker)?;
+    // Walk back to the opening quote of the string literal.
+    let before = &html[..anchor];
+    let quote = before.rfind(['"', '\''])?;
+    let quote_char = before.as_bytes()[quote] as char;
+    let start = quote + 1;
+    let rest = &html[start..];
+    let end = rest.find(quote_char)?;
+    let path = rest[..end].trim();
+    if !path.contains("/v/") {
+        return None;
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        Some(path.to_string())
+    } else if path.starts_with('/') {
+        Some(format!("{SIBNET_BASE}{path}"))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibnet_extracts_relative_path() {
+        let html = r#"<script>var player=new Playerjs({file:"..."});
+            player.src([{src: "/v/e1/2233445.mp4", type:"video/mp4"}]);</script>"#;
+        assert_eq!(
+            sibnet_direct_url(html).as_deref(),
+            Some("https://video.sibnet.ru/v/e1/2233445.mp4"),
+        );
+    }
+
+    #[test]
+    fn sibnet_extracts_absolute_url() {
+        let html = r#"player.src([{src: 'https://cdn.sibnet.ru/v/xy/9.mp4'}])"#;
+        assert_eq!(
+            sibnet_direct_url(html).as_deref(),
+            Some("https://cdn.sibnet.ru/v/xy/9.mp4"),
+        );
+    }
+
+    #[test]
+    fn sibnet_none_when_absent() {
+        assert!(sibnet_direct_url("<html>no source here</html>").is_none());
+    }
 
     #[test]
     fn accepts_https() {
