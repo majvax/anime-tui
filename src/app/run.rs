@@ -847,15 +847,9 @@ impl Runner {
                 // not an episode index, so it would map to the wrong episode.
                 if i < self.pending_sources.len() {
                     if let Some((anime, episode)) = self.playing.clone() {
-                        // Play the chosen source first, then fall back through the
-                        // rest (already resolved) if it fails to start.
-                        let mut queue = Vec::with_capacity(self.pending_sources.len());
-                        queue.push(self.pending_sources[i].clone());
-                        for (j, s) in self.pending_sources.iter().enumerate() {
-                            if j != i {
-                                queue.push(s.clone());
-                            }
-                        }
+                        // Play exactly the chosen source — no silent fallback to a
+                        // different one (that could switch VF→VOSTFR).
+                        let queue = vec![self.pending_sources[i].clone()];
                         self.app.view = View::Player;
                         self.app.loading = true;
                         let _ = self.tx.send(Msg::PlayQueue { anime, episode, queue });
@@ -972,18 +966,12 @@ impl Runner {
                     self.app.loading = false;
                     self.app.set_sources(labels);
                 }
-                // Default: play the preferred source directly, falling back through the
-                // rest (reliability order) if it fails to start.
+                // Default: play the preferred source directly. No fallback to another
+                // source (which could switch language); on failure we surface an error.
                 Ok(sources) => {
                     self.pending_sources = sources.clone();
                     let start = pick_default_index(&sources, &self.default_source);
-                    let mut queue = Vec::with_capacity(sources.len());
-                    queue.push(sources[start].clone());
-                    for (j, s) in sources.into_iter().enumerate() {
-                        if j != start {
-                            queue.push(s);
-                        }
-                    }
+                    let queue = vec![sources[start].clone()];
                     self.app.view = View::Player;
                     self.start_playback_queue(anime, episode, queue).await;
                 }
@@ -998,7 +986,6 @@ impl Runner {
                 // Persist the final observed position so resume works, including
                 // after an early quit. The throttled saves during playback may lag
                 // by a few seconds, so save the last known position here too.
-                let pos = self.app.playback.map(|pb| pb.position).unwrap_or(0.0);
                 if let Some(pb) = self.app.playback {
                     if pb.position > 1.0 {
                         let _ = self.db.save_progress(
@@ -1016,28 +1003,18 @@ impl Runner {
                 // return, not only after re-opening the details page.
                 self.reload_resume_positions();
 
-                // Early failure (mpv errored before any real progress) with more
-                // candidates left → fall back to the next source rather than giving up.
-                let still_current = self.playing.as_ref() == Some(&(anime.clone(), episode.clone()));
-                if result.is_err()
-                    && pos < 2.0
-                    && still_current
-                    && self.playback_attempt < self.playback_queue.len()
-                {
-                    self.advance_playback().await;
-                } else {
-                    match result {
-                        Ok(()) => self.app.set_status("playback finished"),
-                        Err(e) => self.app.set_error(format!("playback error: {e}")),
-                    }
-                    if still_current {
-                        self.playing = None;
-                    }
-                    if self.app.view == View::Player {
-                        self.app.view = View::Episodes;
-                    }
-                    self.app.loading = false;
+                let still_current = self.playing.as_ref() == Some(&(anime, episode));
+                match result {
+                    Ok(()) => self.app.set_status("playback finished"),
+                    Err(e) => self.app.set_error(format!("playback error: {e}")),
                 }
+                if still_current {
+                    self.playing = None;
+                }
+                if self.app.view == View::Player {
+                    self.app.view = View::Episodes;
+                }
+                self.app.loading = false;
             }
             Msg::PlayQueue { anime, episode, queue } => {
                 self.start_playback_queue(anime, episode, queue).await;
