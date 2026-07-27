@@ -20,10 +20,21 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # A tag push does not auto-create a Release, and the upload action below only
+      # uploads to an EXISTING release — so create it first (idempotent, with
+      # auto-generated notes). Requires `contents: write`.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                 --title "${GITHUB_REF_NAME}" --generate-notes
+
       # Builds `anime-tui` for the musl target (fully static: rusqlite is bundled
       # and reqwest uses rustls, so no system libs), strips it, tars it as
       # `anime-tui-x86_64-unknown-linux-musl.tar.gz`, writes a .sha256 sidecar, and
-      # creates/updates the GitHub Release for this tag with the artifacts attached.
+      # uploads the artifacts to the Release created above.
       - name: Build & upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
