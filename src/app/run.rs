@@ -1528,86 +1528,6 @@ fn parse_time_input(s: &str) -> Option<f64> {
     }
 }
 
-/// Try to resolve an embed URL to a direct stream URL via yt-dlp before
-/// handing it to mpv. This eliminates the yt-dlp subprocess delay inside mpv,
-/// so the first frame appears as soon as the network buffer is filled.
-/// Falls back to the original URL on any error.
-/// Resolve an embed-page URL to a direct stream via yt-dlp, capturing BOTH the URL
-/// and the per-stream HTTP headers yt-dlp says it needs (Referer/User-Agent/…).
-///
-/// This is the fix for hosts like sibnet whose CDN 403s unless the request carries
-/// the host's own Referer: `yt-dlp -g` used to return only the URL, so we replayed
-/// it with the generic site referer and the CDN rejected it. `referer` (the embed
-/// page's referer) is passed to yt-dlp so extractors that gate on it still work.
-///
-/// Returns `(url, Some(headers))` on success; `(original_url, None)` when yt-dlp
-/// fails or it's already a direct/local stream (mpv's own ytdl hook then handles a
-/// page URL as a last resort).
-async fn pre_resolve(url: &str, referer: Option<&str>) -> (String, Option<Vec<(String, String)>>) {
-    if url.starts_with("file://") || is_direct_stream(url) {
-        // Already a playable stream (local file or direct HLS/MP4) — skip yt-dlp
-        // entirely; spawning it here would just add ~1-2 s of latency.
-        return (url.to_string(), None);
-    }
-    let mut args: Vec<String> = vec![
-        "--no-playlist".into(),
-        "--quiet".into(),
-        "--no-warnings".into(),
-        "-f".into(),
-        "best".into(),
-        // First line: the direct stream URL. Second line: the format's HTTP headers
-        // as JSON, so we replay the stream with exactly what yt-dlp would send.
-        "--print".into(),
-        "%(url)s".into(),
-        "--print".into(),
-        "%(http_headers)j".into(),
-    ];
-    if let Some(r) = referer {
-        args.push("--referer".into());
-        args.push(r.to_string());
-    }
-    args.push(url.to_string());
-
-    let Ok(out) = tokio::process::Command::new("yt-dlp")
-        .args(&args)
-        .output()
-        .await
-    else {
-        return (url.to_string(), None);
-    };
-    if out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut lines = stdout.lines();
-        if let Some(direct) = lines.next().map(str::trim) {
-            if direct.starts_with("http://") || direct.starts_with("https://") {
-                let headers = lines.next().and_then(parse_ytdl_headers);
-                return (direct.to_string(), headers);
-            }
-        }
-    }
-    (url.to_string(), None)
-}
-
-/// Parse yt-dlp's `%(http_headers)j` output (a JSON object of header→value) into an
-/// ordered header list. Returns `None` if it isn't a non-empty JSON object.
-fn parse_ytdl_headers(json: &str) -> Option<Vec<(String, String)>> {
-    let map: serde_json::Map<String, Value> = serde_json::from_str(json.trim()).ok()?;
-    let headers: Vec<(String, String)> = map
-        .into_iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-        .collect();
-    (!headers.is_empty()).then_some(headers)
-}
-
-/// True if `url` already points at a stream mpv can open directly, so yt-dlp
-/// resolution can be skipped. Conservative: only obvious HLS/MP4 media URLs.
-fn is_direct_stream(url: &str) -> bool {
-    // Ignore any query string / fragment when checking the path extension.
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let path = path.to_ascii_lowercase();
-    path.ends_with(".m3u8") || path.ends_with(".mp4") || path.ends_with(".mkv")
-}
-
 /// Resolve an episode to a list of validated playable sources. http/https URLs
 /// pass the scheme allowlist; `file://` is accepted only as a local/dev
 /// affordance (used by the mock provider).
@@ -1750,67 +1670,21 @@ async fn fetch_thumb_png(
     .map_err(|e| Error::Resolve(format!("thumb task: {e}")))?
 }
 
-/// Resolve an episode AND pre-resolve every source's direct stream URL (in
-/// parallel) via yt-dlp, so both single-source play and source selection are
-/// instant afterwards. Used by the direct-play path and by prefetch.
+/// Resolve an episode to its ordered, validated sources. The embed/provider URL is
+/// handed to mpv as-is; mpv's ytdl hook resolves the actual stream and applies the
+/// correct per-host request headers (Referer/User-Agent), which is far more robust
+/// than re-implementing that here. Used by the direct-play path and by prefetch.
 async fn resolve_and_prepare(
     provider: &dyn Provider,
     anime: &AnimeId,
     episode: &EpisodeId,
 ) -> Result<Vec<PreparedSource>> {
-    let mut sources = resolve_sources(provider, anime, episode).await?;
-    let resolved = futures::future::join_all(
-        sources
-            .iter()
-            .map(|s| {
-                let url = s.url.clone();
-                let referer = referer_of(&s.headers);
-                async move { pre_resolve(&url, referer.as_deref()).await }
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await;
-    for (s, (u, headers)) in sources.iter_mut().zip(resolved) {
-        s.url = u;
-        // Overlay yt-dlp's access-control headers (correct Referer/UA for the CDN)
-        // onto the site headers, keeping the site referer when yt-dlp gives none.
-        if let Some(h) = headers {
-            merge_stream_headers(&mut s.headers, h);
-        }
-    }
-    Ok(sources)
-}
-
-/// Overlay yt-dlp's stream headers onto `base`, keeping ONLY the access-control
-/// headers that are safe for mpv's comma-separated `--http-header-fields`. yt-dlp's
-/// full header set includes `Accept`/`Accept-Language` whose values contain commas —
-/// forwarding those corrupts the whole header list (mpv splits on `,`) and breaks
-/// every request, so we allowlist and drop any comma-containing value.
-fn merge_stream_headers(base: &mut Vec<(String, String)>, extra: Vec<(String, String)>) {
-    const ALLOW: [&str; 3] = ["referer", "user-agent", "origin"];
-    for (k, v) in extra {
-        if v.contains(',') || !ALLOW.contains(&k.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        if let Some(slot) = base.iter_mut().find(|(bk, _)| bk.eq_ignore_ascii_case(&k)) {
-            slot.1 = v;
-        } else {
-            base.push((k, v));
-        }
-    }
-}
-
-/// The `Referer` value from a header list, if present (case-insensitive key).
-fn referer_of(headers: &[(String, String)]) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
-        .map(|(_, v)| v.clone())
+    resolve_sources(provider, anime, episode).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{host_rank, keep_in_view, parse_ytdl_headers, pick_default_index, referer_of, PreparedSource};
+    use super::{host_rank, keep_in_view, pick_default_index, PreparedSource};
 
     fn src(label: &str) -> PreparedSource {
         PreparedSource { url: "https://x/v".into(), headers: vec![], label: Some(label.into()) }
@@ -1838,52 +1712,6 @@ mod tests {
         let mut labels = vec!["voe (VF)", "vidmoly (VF)", "sibnet (VF)"];
         labels.sort_by_key(|l| host_rank(l));
         assert_eq!(labels, vec!["vidmoly (VF)", "sibnet (VF)", "voe (VF)"]);
-    }
-
-    #[test]
-    fn parse_ytdl_headers_reads_json_map() {
-        let h = parse_ytdl_headers(r#"{"Referer":"https://sibnet.ru/","User-Agent":"x"}"#).unwrap();
-        assert!(h.iter().any(|(k, v)| k == "Referer" && v == "https://sibnet.ru/"));
-        assert!(h.iter().any(|(k, v)| k == "User-Agent" && v == "x"));
-        // Empty / non-object → None (fall back to keeping existing headers).
-        assert!(parse_ytdl_headers("{}").is_none());
-        assert!(parse_ytdl_headers("not json").is_none());
-    }
-
-    #[test]
-    fn merge_stream_headers_allowlists_and_drops_commas() {
-        use super::merge_stream_headers;
-        let mut base = vec![("Referer".to_string(), "https://nakanime.tv/".to_string())];
-        merge_stream_headers(
-            &mut base,
-            vec![
-                ("Referer".into(), "https://video.sibnet.ru/".into()), // overrides
-                ("User-Agent".into(), "Mozilla/5.0".into()),           // added
-                ("Accept".into(), "text/html,application/xml".into()), // dropped (comma)
-                ("Sec-Fetch-Mode".into(), "navigate".into()),          // dropped (not allowed)
-            ],
-        );
-        // Referer overridden to the CDN host, UA added, comma/other headers dropped.
-        assert!(base.iter().any(|(k, v)| k == "Referer" && v == "https://video.sibnet.ru/"));
-        assert!(base.iter().any(|(k, v)| k == "User-Agent" && v == "Mozilla/5.0"));
-        assert!(!base.iter().any(|(k, _)| k == "Accept"));
-        assert!(!base.iter().any(|(k, _)| k == "Sec-Fetch-Mode"));
-    }
-
-    #[test]
-    fn merge_stream_headers_keeps_site_referer_when_none_given() {
-        use super::merge_stream_headers;
-        let mut base = vec![("Referer".to_string(), "https://nakanime.tv/".to_string())];
-        merge_stream_headers(&mut base, vec![("User-Agent".into(), "UA".into())]);
-        assert!(base.iter().any(|(k, v)| k == "Referer" && v == "https://nakanime.tv/"));
-        assert!(base.iter().any(|(k, v)| k == "User-Agent" && v == "UA"));
-    }
-
-    #[test]
-    fn referer_of_is_case_insensitive() {
-        let h = vec![("referer".to_string(), "https://nakanime.tv/".to_string())];
-        assert_eq!(referer_of(&h).as_deref(), Some("https://nakanime.tv/"));
-        assert!(referer_of(&[]).is_none());
     }
 
     #[test]
