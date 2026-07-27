@@ -59,6 +59,12 @@ enum Msg {
         episode: EpisodeId,
         result: Result<()>,
     },
+    /// Play an ordered set of fallback candidates for an episode (picker choice).
+    PlayQueue {
+        anime: AnimeId,
+        episode: EpisodeId,
+        queue: Vec<PreparedSource>,
+    },
     /// Background prefetch of an episode's sources completed (empty on failure).
     Prefetched {
         episode: EpisodeId,
@@ -98,6 +104,13 @@ pub struct Runner {
     /// Runner-side list of validated sources for the current selection request.
     /// The App only holds display labels; the Runner holds the actual URLs.
     pending_sources: Vec<PreparedSource>,
+
+    /// Ordered playback candidates for the episode being played, and the index of
+    /// the next one to try. When a source fails to start (mpv exit ≠ 0 before any
+    /// progress), playback falls back to the next candidate — so a dead/blocked
+    /// host (e.g. voe) transparently yields to a working one.
+    playback_queue: Vec<PreparedSource>,
+    playback_attempt: usize,
 
     /// Prefetched, fully-resolved sources keyed by episode id, so pressing Enter
     /// on an episode you were hovering plays instantly. Cleared per anime.
@@ -200,6 +213,8 @@ impl Runner {
             current_source: None,
             last_saved_pos: 0.0,
             pending_sources: Vec::new(),
+            playback_queue: Vec::new(),
+            playback_attempt: 0,
             source_cache: std::collections::HashMap::new(),
             prefetch_inflight: None,
             prefetch_target: None,
@@ -830,25 +845,24 @@ impl Runner {
                 });
             }
             Effect::SelectSource(i) => {
-                if let Some(source) = self.pending_sources.get(i).cloned() {
-                    // Use the (anime, episode) pair captured when the sources were
-                    // resolved. Do NOT recompute from `episodes_state.selected()`:
-                    // with the season-fold tree that is a ROW index (headers
-                    // included), not an episode index, so it would map to the wrong
-                    // episode — progress would save under the wrong id.
+                // Use the (anime, episode) pair captured when the sources were
+                // resolved. Do NOT recompute from `episodes_state.selected()`:
+                // with the season-fold tree that is a ROW index (headers included),
+                // not an episode index, so it would map to the wrong episode.
+                if i < self.pending_sources.len() {
                     if let Some((anime, episode)) = self.playing.clone() {
-                        let tx = self.tx.clone();
-                        tokio::spawn(async move {
-                            let mut s = source;
-                            s.url = pre_resolve_url(&s.url).await;
-                            let _ = tx.send(Msg::Resolved {
-                                anime,
-                                episode,
-                                result: Ok(vec![s]),
-                            });
-                        });
+                        // Play the chosen source first, then fall back through the
+                        // rest (already resolved) if it fails to start.
+                        let mut queue = Vec::with_capacity(self.pending_sources.len());
+                        queue.push(self.pending_sources[i].clone());
+                        for (j, s) in self.pending_sources.iter().enumerate() {
+                            if j != i {
+                                queue.push(s.clone());
+                            }
+                        }
                         self.app.view = View::Player;
                         self.app.loading = true;
+                        let _ = self.tx.send(Msg::PlayQueue { anime, episode, queue });
                     }
                 }
             }
@@ -937,7 +951,7 @@ impl Runner {
                 Ok(sources) => {
                     if sources.len() == 1 {
                         self.pending_sources = sources.clone();
-                        self.begin_playback(anime, episode, sources.into_iter().next().unwrap()).await;
+                        self.start_playback_queue(anime, episode, sources).await;
                     } else {
                         // Multiple sources: show selection list; runner retains all of them.
                         let labels: Vec<String> = sources
@@ -962,6 +976,7 @@ impl Runner {
                 // Persist the final observed position so resume works, including
                 // after an early quit. The throttled saves during playback may lag
                 // by a few seconds, so save the last known position here too.
+                let pos = self.app.playback.map(|pb| pb.position).unwrap_or(0.0);
                 if let Some(pb) = self.app.playback {
                     if pb.position > 1.0 {
                         let _ = self.db.save_progress(
@@ -979,17 +994,31 @@ impl Runner {
                 // return, not only after re-opening the details page.
                 self.reload_resume_positions();
 
-                self.app.set_status(match result {
-                    Ok(()) => "playback finished".into(),
-                    Err(e) => format!("playback error: {e}"),
-                });
-                if self.playing.as_ref() == Some(&(anime, episode)) {
-                    self.playing = None;
+                // Early failure (mpv errored before any real progress) with more
+                // candidates left → fall back to the next source rather than giving up.
+                let still_current = self.playing.as_ref() == Some(&(anime.clone(), episode.clone()));
+                if result.is_err()
+                    && pos < 2.0
+                    && still_current
+                    && self.playback_attempt < self.playback_queue.len()
+                {
+                    self.advance_playback().await;
+                } else {
+                    match result {
+                        Ok(()) => self.app.set_status("playback finished"),
+                        Err(e) => self.app.set_error(format!("playback error: {e}")),
+                    }
+                    if still_current {
+                        self.playing = None;
+                    }
+                    if self.app.view == View::Player {
+                        self.app.view = View::Episodes;
+                    }
+                    self.app.loading = false;
                 }
-                if self.app.view == View::Player {
-                    self.app.view = View::Episodes;
-                }
-                self.app.loading = false;
+            }
+            Msg::PlayQueue { anime, episode, queue } => {
+                self.start_playback_queue(anime, episode, queue).await;
             }
             Msg::Prefetched { episode, sources } => {
                 if self.prefetch_inflight.as_deref() == Some(episode.0.as_str()) {
@@ -1021,7 +1050,60 @@ impl Runner {
         }
     }
 
-    async fn begin_playback(&mut self, anime: AnimeId, episode: EpisodeId, source: PreparedSource) {
+    /// Set up an ordered fallback queue for an episode and start the first source.
+    async fn start_playback_queue(
+        &mut self,
+        anime: AnimeId,
+        episode: EpisodeId,
+        queue: Vec<PreparedSource>,
+    ) {
+        self.playing = Some((anime, episode));
+        self.playback_queue = queue;
+        self.playback_attempt = 0;
+        self.advance_playback().await;
+    }
+
+    /// Start the next candidate in `playback_queue`. For the embedded backend a
+    /// synchronous start failure immediately tries the following candidate; for the
+    /// external backend a failure arrives later as `Msg::ExternalEnded`, which calls
+    /// back here. When the queue is exhausted, surface the failure.
+    async fn advance_playback(&mut self) {
+        let Some((anime, episode)) = self.playing.clone() else {
+            return;
+        };
+        loop {
+            let idx = self.playback_attempt;
+            let Some(source) = self.playback_queue.get(idx).cloned() else {
+                self.app.set_error("all sources failed to load");
+                if self.app.view == View::Player {
+                    self.app.view = View::Episodes;
+                }
+                self.app.loading = false;
+                self.playing = None;
+                return;
+            };
+            self.playback_attempt += 1;
+            if idx > 0 {
+                // A previous candidate failed — tell the user what we're trying now.
+                let host = source.label.clone().unwrap_or_else(|| "next source".into());
+                self.app.set_status(format!("trying source {host}…"));
+            }
+            if self.begin_playback(anime.clone(), episode.clone(), source).await {
+                return; // running (embedded) or spawned (external)
+            }
+            // Embedded start failed synchronously → try the next candidate.
+        }
+    }
+
+    /// Start playing one source. Returns `true` if it started (embedded) or was
+    /// spawned (external), `false` if the embedded backend failed to start (so the
+    /// caller can fall back to the next candidate).
+    async fn begin_playback(
+        &mut self,
+        anime: AnimeId,
+        episode: EpisodeId,
+        source: PreparedSource,
+    ) -> bool {
         // Never run two players at once.
         if let Some(p) = self.player.take() {
             p.stop().await;
@@ -1057,10 +1139,13 @@ impl Runner {
                     Ok(player) => {
                         self.player = Some(player);
                         self.app.set_status("playing (embedded)");
+                        true
                     }
                     Err(e) => {
-                        self.fail(e);
-                        self.app.view = View::Episodes;
+                        // Let the caller try the next candidate.
+                        self.app.set_error(format!("player error: {e}"));
+                        self.app.playback = None;
+                        false
                     }
                 }
             }
@@ -1088,6 +1173,7 @@ impl Runner {
                     let _ = tx.send(Msg::ExternalEnded { anime, episode, result });
                 });
                 self.app.set_status("playing (external mpv)");
+                true
             }
         }
     }
@@ -1428,31 +1514,71 @@ fn parse_time_input(s: &str) -> Option<f64> {
 /// handing it to mpv. This eliminates the yt-dlp subprocess delay inside mpv,
 /// so the first frame appears as soon as the network buffer is filled.
 /// Falls back to the original URL on any error.
-async fn pre_resolve_url(url: &str) -> String {
+/// Resolve an embed-page URL to a direct stream via yt-dlp, capturing BOTH the URL
+/// and the per-stream HTTP headers yt-dlp says it needs (Referer/User-Agent/…).
+///
+/// This is the fix for hosts like sibnet whose CDN 403s unless the request carries
+/// the host's own Referer: `yt-dlp -g` used to return only the URL, so we replayed
+/// it with the generic site referer and the CDN rejected it. `referer` (the embed
+/// page's referer) is passed to yt-dlp so extractors that gate on it still work.
+///
+/// Returns `(url, Some(headers))` on success; `(original_url, None)` when yt-dlp
+/// fails or it's already a direct/local stream (mpv's own ytdl hook then handles a
+/// page URL as a last resort).
+async fn pre_resolve(url: &str, referer: Option<&str>) -> (String, Option<Vec<(String, String)>>) {
     if url.starts_with("file://") || is_direct_stream(url) {
         // Already a playable stream (local file or direct HLS/MP4) — skip yt-dlp
         // entirely; spawning it here would just add ~1-2 s of latency.
-        return url.to_string();
+        return (url.to_string(), None);
     }
+    let mut args: Vec<String> = vec![
+        "--no-playlist".into(),
+        "--quiet".into(),
+        "--no-warnings".into(),
+        "-f".into(),
+        "best".into(),
+        // First line: the direct stream URL. Second line: the format's HTTP headers
+        // as JSON, so we replay the stream with exactly what yt-dlp would send.
+        "--print".into(),
+        "%(url)s".into(),
+        "--print".into(),
+        "%(http_headers)j".into(),
+    ];
+    if let Some(r) = referer {
+        args.push("--referer".into());
+        args.push(r.to_string());
+    }
+    args.push(url.to_string());
+
     let Ok(out) = tokio::process::Command::new("yt-dlp")
-        .args(["-g", "--no-playlist", "--quiet", "--no-warnings", url])
+        .args(&args)
         .output()
         .await
     else {
-        return url.to_string();
+        return (url.to_string(), None);
     };
     if out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // yt-dlp can return multiple lines (audio + video for adaptive streams);
-        // take the first line which is always the video stream.
-        if let Some(line) = stdout.lines().next() {
-            let direct = line.trim();
+        let mut lines = stdout.lines();
+        if let Some(direct) = lines.next().map(str::trim) {
             if direct.starts_with("http://") || direct.starts_with("https://") {
-                return direct.to_string();
+                let headers = lines.next().and_then(parse_ytdl_headers);
+                return (direct.to_string(), headers);
             }
         }
     }
-    url.to_string()
+    (url.to_string(), None)
+}
+
+/// Parse yt-dlp's `%(http_headers)j` output (a JSON object of header→value) into an
+/// ordered header list. Returns `None` if it isn't a non-empty JSON object.
+fn parse_ytdl_headers(json: &str) -> Option<Vec<(String, String)>> {
+    let map: serde_json::Map<String, Value> = serde_json::from_str(json.trim()).ok()?;
+    let headers: Vec<(String, String)> = map
+        .into_iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+        .collect();
+    (!headers.is_empty()).then_some(headers)
 }
 
 /// True if `url` already points at a stream mpv can open directly, so yt-dlp
@@ -1473,7 +1599,7 @@ async fn resolve_sources(
     episode: &EpisodeId,
 ) -> Result<Vec<PreparedSource>> {
     let sources = provider.resolve(anime, episode).await?;
-    let prepared: Vec<PreparedSource> = sources
+    let mut prepared: Vec<PreparedSource> = sources
         .into_iter()
         .filter_map(|s| {
             let url = if s.url.starts_with("file://") {
@@ -1491,7 +1617,26 @@ async fn resolve_sources(
     if prepared.is_empty() {
         return Err(Error::Resolve("no valid sources returned".into()));
     }
+    // Try known-resolvable hosts first (and, on failure, fall back in this order).
+    // Stable sort preserves the provider's per-host language ordering.
+    prepared.sort_by_key(|s| host_rank(s.label.as_deref().unwrap_or("")));
     Ok(prepared)
+}
+
+/// Reliability rank for a source host (lower = try first). yt-dlp resolves
+/// vidmoly (generic) and sibnet (dedicated extractor); voe has no working
+/// extractor today, so it sorts last and is only reached via fallback.
+fn host_rank(label: &str) -> u8 {
+    let l = label.to_ascii_lowercase();
+    if l.contains("voe") {
+        3
+    } else if l.contains("vidmoly") {
+        0
+    } else if l.contains("sibnet") {
+        1
+    } else {
+        2
+    }
 }
 
 /// Raw image bytes from the on-disk cache, else fetched from `url` (via the shared
@@ -1580,20 +1725,64 @@ async fn resolve_and_prepare(
             .iter()
             .map(|s| {
                 let url = s.url.clone();
-                async move { pre_resolve_url(&url).await }
+                let referer = referer_of(&s.headers);
+                async move { pre_resolve(&url, referer.as_deref()).await }
             })
             .collect::<Vec<_>>(),
     )
     .await;
-    for (s, u) in sources.iter_mut().zip(resolved) {
+    for (s, (u, headers)) in sources.iter_mut().zip(resolved) {
         s.url = u;
+        // Prefer yt-dlp's per-stream headers (correct Referer/UA for the CDN); keep
+        // the site referer only when resolution didn't yield any (page fallback).
+        if let Some(h) = headers {
+            s.headers = h;
+        }
     }
     Ok(sources)
 }
 
+/// The `Referer` value from a header list, if present (case-insensitive key).
+fn referer_of(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+        .map(|(_, v)| v.clone())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::keep_in_view;
+    use super::{host_rank, keep_in_view, parse_ytdl_headers, referer_of};
+
+    #[test]
+    fn host_rank_orders_working_hosts_first_voe_last() {
+        // Reliability order: vidmoly < sibnet < unknown < voe.
+        assert!(host_rank("vidmoly (VF)") < host_rank("sibnet (VF)"));
+        assert!(host_rank("sibnet (VF)") < host_rank("mystery (VOSTFR)"));
+        assert!(host_rank("mystery (VOSTFR)") < host_rank("voe (VOSTFR)"));
+
+        // A mixed list sorts voe to the end, stably preserving other order.
+        let mut labels = vec!["voe (VF)", "vidmoly (VF)", "sibnet (VF)"];
+        labels.sort_by_key(|l| host_rank(l));
+        assert_eq!(labels, vec!["vidmoly (VF)", "sibnet (VF)", "voe (VF)"]);
+    }
+
+    #[test]
+    fn parse_ytdl_headers_reads_json_map() {
+        let h = parse_ytdl_headers(r#"{"Referer":"https://sibnet.ru/","User-Agent":"x"}"#).unwrap();
+        assert!(h.iter().any(|(k, v)| k == "Referer" && v == "https://sibnet.ru/"));
+        assert!(h.iter().any(|(k, v)| k == "User-Agent" && v == "x"));
+        // Empty / non-object → None (fall back to keeping existing headers).
+        assert!(parse_ytdl_headers("{}").is_none());
+        assert!(parse_ytdl_headers("not json").is_none());
+    }
+
+    #[test]
+    fn referer_of_is_case_insensitive() {
+        let h = vec![("referer".to_string(), "https://nakanime.tv/".to_string())];
+        assert_eq!(referer_of(&h).as_deref(), Some("https://nakanime.tv/"));
+        assert!(referer_of(&[]).is_none());
+    }
 
     #[test]
     fn keep_in_view_scrolls_only_when_needed() {

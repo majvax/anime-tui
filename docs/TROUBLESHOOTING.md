@@ -26,6 +26,20 @@ may report cell size inconsistently mid-resize; try again after the resize settl
 Expected until Phase 3. Nakanime endpoints/selectors are deliberately unverified
 placeholders — see `docs/PROVIDER_MAINTENANCE.md`.
 
+### An episode source won't play (mpv exits immediately)
+Playback resolves embed hosts with **yt-dlp**, so a host only works if yt-dlp can
+extract it. The app tries the episode's sources best-first and **falls back**
+automatically when one fails (you'll see "trying source …"), so a dead host yields
+to a working one.
+- **sibnet / vidmoly**: supported (sibnet has a yt-dlp extractor; vidmoly resolves
+  via yt-dlp's generic extractor). If they fail, run `yt-dlp -U` to update.
+- **voe**: current yt-dlp has *no* voe extractor, so voe can't be resolved — the
+  app falls back to another source. If an episode's *only* source is voe, it can't
+  play until yt-dlp adds voe support (or a native resolver is contributed from a
+  real voe embed sample).
+Diagnose a specific host with:
+`yt-dlp -f best --print "%(url)s" --print "%(http_headers)j" '<embed URL>'`.
+
 ### High CPU during playback
 `--vo=kitty` uploads frames as escape sequences; cost scales with the video
 rectangle's pixel area and fps. Shrink the reserved rectangle, or try
