@@ -126,6 +126,10 @@ pub struct Runner {
     last_poster_rect: Option<CellRect>,
     /// Anime id whose (details) poster fetch is in flight (at most one at a time).
     poster_inflight: Option<String>,
+    /// The cover URL last fetched for the current details anime. Lets us start the
+    /// poster from the browse summary URL immediately and skip the redundant
+    /// higher-res `Msg::Details` fetch when it's the same image.
+    last_poster_url: Option<String>,
 
     /// Shared HTTP client for poster/thumbnail fetches (connection pooling — the
     /// per-call `reqwest::get` was the ~2 s cost while browsing).
@@ -207,6 +211,7 @@ impl Runner {
             poster_shown: false,
             last_poster_rect: None,
             poster_inflight: None,
+            last_poster_url: None,
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -763,6 +768,25 @@ impl Runner {
                 });
             }
             Effect::LoadDetails(id) => {
+                // Leaving the browse list for Details: remove the row thumbnails now
+                // (not on the next frame) so none linger over the details page, and
+                // drop the previous poster so a stale cover isn't shown.
+                self.clear_thumbnails();
+                self.current_poster = None;
+                self.poster_dirty = false;
+                // Fast path: start fetching the cover from the browse summary's URL
+                // immediately, in parallel with the details HTML round-trip, so the
+                // poster isn't gated on that request. The details cover (higher-res)
+                // upgrades it later if it's a different URL.
+                self.last_poster_url = self
+                    .app
+                    .results
+                    .iter()
+                    .find(|a| a.id == id)
+                    .and_then(|a| a.poster_url.clone());
+                if let Some(url) = self.last_poster_url.clone() {
+                    self.fetch_poster(id.clone(), url);
+                }
                 let (provider, tx) = (self.provider.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     let _ = tx.send(Msg::Details(provider.details(&id).await));
@@ -857,12 +881,13 @@ impl Runner {
                 self.app.set_status(format!("load more failed: {e}"));
             }
             Msg::Details(Ok(details)) => {
-                // Cache title for history lookups.
+                // Cache title + cover so history/favourites can show them later.
                 let _ = self.db.cache_anime(
                     self.provider.name(),
                     &details.id.0,
                     &details.title,
                     None,
+                    details.poster_url.as_deref(),
                 );
                 // Load resume positions and favourite flag.
                 self.app.resume_positions = self
@@ -879,11 +904,15 @@ impl Runner {
                 self.prefetch_target = None;
                 self.prefetch_queue.clear();
                 self.queue_resume_prefetch(&details);
-                // Drop the previous poster and fetch this one's cover (Kitty only).
-                self.current_poster = None;
-                self.poster_dirty = false;
+                // The poster was already kicked off from the summary URL in
+                // LoadDetails; upgrade to the details cover (higher-res extraLarge)
+                // only when it's a different URL — no reset, so the fast cover isn't
+                // blanked, and no redundant fetch when the URLs match.
                 if let Some(url) = details.poster_url.clone() {
-                    self.fetch_poster(details.id.clone(), url);
+                    if self.last_poster_url.as_deref() != Some(url.as_str()) {
+                        self.last_poster_url = Some(url.clone());
+                        self.fetch_poster(details.id.clone(), url);
+                    }
                 }
                 self.app.set_details(details);
             }
@@ -1097,6 +1126,11 @@ impl Runner {
     }
 
     async fn on_tick(&mut self) {
+        // Age transient status messages and advance the loading spinner.
+        self.app.tick_status();
+        if self.app.loading || self.app.loading_more {
+            self.app.advance_spinner();
+        }
         // Detect embedded mpv exiting on its own (end of file / crash).
         if let Some(player) = &mut self.player {
             if player.finished() {
@@ -1346,7 +1380,8 @@ impl Runner {
 
     fn fail(&mut self, e: Error) {
         self.app.loading = false;
-        self.app.set_status(format!("error: {e}"));
+        self.app.loading_more = false;
+        self.app.set_error(format!("error: {e}"));
     }
 }
 

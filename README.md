@@ -125,6 +125,10 @@ Copy `config.example.toml` to the platform config dir (printed by the app) as
 `config.toml`. `base_url` is empty by default — set it to the Nakanime host you
 are authorized to access. See `docs/KEYBINDINGS.md` for shortcuts.
 
+CLI flags: `anime-tui --paths` prints the config/data/cache directories,
+`--config <path>` uses an alternate config file, and `--version` / `--help` do
+the obvious.
+
 ## Backends & performance
 
 Playback has two backends. The **default is a standalone mpv window** — it renders

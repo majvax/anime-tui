@@ -4,7 +4,7 @@
 use crate::errors::{Error, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,8 +83,13 @@ impl Default for Playback {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&Self::config_path()?)
+    }
+
+    /// Load config from a specific path. A missing file yields defaults (so the app
+    /// runs out of the box); a present-but-invalid file is an error.
+    pub fn load_from(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(s) => toml::from_str(&s).map_err(|e| Error::Config(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(Error::Io(e)),
@@ -129,5 +134,17 @@ mod tests {
         let c: Config = toml::from_str("[playback]\nskip_intro_secs = 90\n").unwrap();
         assert_eq!(c.playback.skip_intro_secs, 90);
         assert_eq!(c.playback.max_buffer_mib, 64);
+    }
+
+    #[test]
+    fn load_from_reads_alternate_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alt.toml");
+        std::fs::write(&path, "base_url = \"https://example.test\"\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!(c.base_url, "https://example.test");
+        // A missing file falls back to defaults rather than erroring.
+        let missing = Config::load_from(&dir.path().join("nope.toml")).unwrap();
+        assert_eq!(missing.base_url, Config::default().base_url);
     }
 }

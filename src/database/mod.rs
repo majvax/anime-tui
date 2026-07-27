@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS anime_cache (
     anime_id   TEXT NOT NULL,
     title      TEXT NOT NULL,
     year       INTEGER,
+    poster_url TEXT,
     PRIMARY KEY (provider, anime_id)
 );
 
@@ -61,16 +62,37 @@ impl Database {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)
             .map_err(|e| Error::Database(e.to_string()))?;
+        // Migrate pre-existing databases created before `poster_url` existed. The
+        // column is part of SCHEMA for fresh DBs; here we add it if missing and
+        // ignore the "duplicate column name" error when it's already present.
+        if let Err(e) = conn.execute("ALTER TABLE anime_cache ADD COLUMN poster_url TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(Error::Database(msg));
+            }
+        }
         Ok(Self { conn })
     }
 
-    /// Cache anime metadata so history/favourites can show titles.
-    pub fn cache_anime(&self, provider: &str, anime_id: &str, title: &str, year: Option<u16>) -> Result<()> {
+    /// Cache anime metadata so history/favourites can show titles and cover
+    /// thumbnails. `poster_url` is preserved across upserts if a later call passes
+    /// `None` (so a title-only refresh never wipes a known cover).
+    pub fn cache_anime(
+        &self,
+        provider: &str,
+        anime_id: &str,
+        title: &str,
+        year: Option<u16>,
+        poster_url: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO anime_cache (provider, anime_id, title, year)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(provider, anime_id) DO UPDATE SET title = excluded.title, year = excluded.year",
-            rusqlite::params![provider, anime_id, title, year.map(|y| y as i64)],
+            "INSERT INTO anime_cache (provider, anime_id, title, year, poster_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, anime_id) DO UPDATE SET
+                 title = excluded.title,
+                 year = excluded.year,
+                 poster_url = COALESCE(excluded.poster_url, anime_cache.poster_url)",
+            rusqlite::params![provider, anime_id, title, year.map(|y| y as i64), poster_url],
         ).map_err(|e| Error::Database(e.to_string()))?;
         Ok(())
     }
@@ -186,7 +208,7 @@ impl Database {
 
     pub fn list_favourites(&self, provider: &str) -> Result<Vec<AnimeSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.anime_id, f.title, ac.year
+            "SELECT f.anime_id, f.title, ac.year, ac.poster_url
              FROM favourites f
              LEFT JOIN anime_cache ac ON f.provider = ac.provider AND f.anime_id = ac.anime_id
              WHERE f.provider = ?1
@@ -196,7 +218,7 @@ impl Database {
             Ok(AnimeSummary {
                 id: AnimeId(row.get::<_, String>(0)?),
                 title: row.get(1)?,
-                poster_url: None,
+                poster_url: row.get::<_, Option<String>>(3)?,
                 year: row.get::<_, Option<i64>>(2)?.map(|y| y as u16),
             })
         }).map_err(|e| Error::Database(e.to_string()))?;
@@ -206,7 +228,7 @@ impl Database {
 
     pub fn list_history(&self, provider: &str) -> Result<Vec<AnimeSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT h.anime_id, COALESCE(ac.title, h.anime_id), ac.year
+            "SELECT h.anime_id, COALESCE(ac.title, h.anime_id), ac.year, ac.poster_url
              FROM history h
              LEFT JOIN anime_cache ac ON ac.provider=h.provider AND ac.anime_id=h.anime_id
              WHERE h.provider=?1
@@ -218,7 +240,7 @@ impl Database {
             Ok(AnimeSummary {
                 id: AnimeId(row.get::<_, String>(0)?),
                 title: row.get(1)?,
-                poster_url: None,
+                poster_url: row.get::<_, Option<String>>(3)?,
                 year: row.get::<_, Option<i64>>(2)?.map(|y| y as u16),
             })
         }).map_err(|e| Error::Database(e.to_string()))?;
@@ -287,13 +309,38 @@ mod tests {
     #[test]
     fn list_history_distinct_by_anime() {
         let db = Database::open_in_memory().unwrap();
-        db.cache_anime("mock", "a1", "Anime One", Some(2020)).unwrap();
+        db.cache_anime("mock", "a1", "Anime One", Some(2020), None).unwrap();
         db.save_progress("mock", "a1", "ep1", 10.0, 1400.0).unwrap();
         db.save_progress("mock", "a1", "ep2", 20.0, 1400.0).unwrap();
         let hist = db.list_history("mock").unwrap();
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].title, "Anime One");
         assert_eq!(hist[0].year, Some(2020));
+    }
+
+    #[test]
+    fn cached_poster_url_surfaces_in_lists() {
+        let db = Database::open_in_memory().unwrap();
+        db.cache_anime("mock", "a1", "Anime One", Some(2020), Some("https://img/p.jpg"))
+            .unwrap();
+        db.toggle_favourite("mock", "a1", "Anime One").unwrap();
+        db.save_progress("mock", "a1", "ep1", 10.0, 1400.0).unwrap();
+
+        let favs = db.list_favourites("mock").unwrap();
+        assert_eq!(favs[0].poster_url.as_deref(), Some("https://img/p.jpg"));
+        let hist = db.list_history("mock").unwrap();
+        assert_eq!(hist[0].poster_url.as_deref(), Some("https://img/p.jpg"));
+    }
+
+    #[test]
+    fn cache_anime_preserves_poster_on_title_only_update() {
+        let db = Database::open_in_memory().unwrap();
+        db.cache_anime("mock", "a1", "One", None, Some("https://img/p.jpg")).unwrap();
+        // A later title-only refresh (poster None) must not wipe the known cover.
+        db.cache_anime("mock", "a1", "One (updated)", None, None).unwrap();
+        db.toggle_favourite("mock", "a1", "One").unwrap();
+        let favs = db.list_favourites("mock").unwrap();
+        assert_eq!(favs[0].poster_url.as_deref(), Some("https://img/p.jpg"));
     }
 
     #[test]

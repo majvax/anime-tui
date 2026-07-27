@@ -6,8 +6,8 @@
 use crate::app::{self, App, View};
 use crate::player::kitty::CellRect;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -64,13 +64,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Braille spinner frames for loading indicators.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner_char(frame: usize) -> &'static str {
+    SPINNER[frame % SPINNER.len()]
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.loading {
-        " loading... ".to_string()
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let line = if app.loading {
+        Line::from(format!(" {} loading…", spinner_char(app.spinner_frame))).style(dim)
     } else if app.input_mode && app.filtering {
-        format!(" filter: {}|  (Enter keep · Esc clear)", app.filter)
+        Line::from(format!(" filter: {}|  (Enter keep · Esc clear)", app.filter)).style(dim)
     } else if app.input_mode {
-        format!(" search: {}|", app.search_input)
+        Line::from(format!(" search: {}|", app.search_input)).style(dim)
     } else {
         let hint = match app.view {
             View::Home | View::Search => {
@@ -85,11 +93,23 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             View::Player => " Space pause · ,/. ±5s · h/l ±10s · i skip intro · g seek · o window · f fullscreen · n/p ep · q stop",
         };
         match app.status.as_deref() {
-            Some(s) => format!(" {s}  ·  {}", hint.trim()),
-            None => hint.to_string(),
+            // Colour the status by severity; keep the hint dim after it.
+            Some(s) => {
+                let status_style = match app.status_level {
+                    app::StatusLevel::Error => {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    }
+                    app::StatusLevel::Info => Style::default().fg(Color::Yellow),
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {s}"), status_style),
+                    Span::styled(format!("  ·  {}", hint.trim()), dim),
+                ])
+            }
+            None => Line::from(hint).style(dim),
         }
     };
-    frame.render_widget(Paragraph::new(text).style(Style::default().dim()), area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Browse-list block title: base label plus filter/count/sort/loading context.
@@ -105,7 +125,11 @@ fn browse_title(app: &App) -> String {
     }
     // Catalogue views show pagination/sort context; local lists just a count.
     if matches!(app.view, View::Home | View::Search) {
-        let more = if app.loading_more { " · loading more…" } else { "" };
+        let more = if app.loading_more {
+            format!(" · {} loading more", spinner_char(app.spinner_frame))
+        } else {
+            String::new()
+        };
         format!(" {base} — {shown}/{} · {}{more} ", app.total, app.sort.label())
     } else {
         format!(" {base} ({shown}) ")

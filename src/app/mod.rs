@@ -137,10 +137,25 @@ pub enum Effect {
     ToggleFavourite(AnimeId, String),
 }
 
+/// Severity of a transient status message, used to colour it in the footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusLevel {
+    #[default]
+    Info,
+    Error,
+}
+
 pub struct App {
     pub view: View,
     pub should_quit: bool,
     pub status: Option<String>,
+    /// Severity of the current `status` (drives its colour).
+    pub status_level: StatusLevel,
+    /// Ticks until the current `status` auto-clears (0 = none). Decremented by
+    /// [`App::tick_status`] on the app tick so messages don't linger forever.
+    pub status_ticks: u16,
+    /// Frame counter for the loading spinner, advanced once per tick.
+    pub spinner_frame: usize,
     pub loading: bool,
 
     /// True while the search box is capturing text.
@@ -210,6 +225,9 @@ impl Default for App {
             view: View::Home,
             should_quit: false,
             status: None,
+            status_level: StatusLevel::Info,
+            status_ticks: 0,
+            spinner_frame: 0,
             loading: false,
             input_mode: false,
             search_input: String::new(),
@@ -382,8 +400,38 @@ impl App {
         }
     }
 
+    /// Default lifetime of a transient status message, in app ticks. At the 250 ms
+    /// tick this is ~5 seconds before it auto-clears.
+    pub const STATUS_TTL_TICKS: u16 = 20;
+
     pub fn set_status(&mut self, status: impl Into<String>) {
         self.status = Some(status.into());
+        self.status_level = StatusLevel::Info;
+        self.status_ticks = Self::STATUS_TTL_TICKS;
+    }
+
+    /// Show an error status (rendered red) that auto-clears like any other.
+    pub fn set_error(&mut self, status: impl Into<String>) {
+        self.status = Some(status.into());
+        self.status_level = StatusLevel::Error;
+        self.status_ticks = Self::STATUS_TTL_TICKS;
+    }
+
+    /// Age the current status by one tick; clear it (and reset the level) when its
+    /// lifetime runs out. No-op when there is no timed status.
+    pub fn tick_status(&mut self) {
+        if self.status_ticks > 0 {
+            self.status_ticks -= 1;
+            if self.status_ticks == 0 {
+                self.status = None;
+                self.status_level = StatusLevel::Info;
+            }
+        }
+    }
+
+    /// Advance the loading-spinner animation by one frame.
+    pub fn advance_spinner(&mut self) {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
     pub fn selected_result(&self) -> Option<&AnimeSummary> {
@@ -831,6 +879,29 @@ mod tests {
         let mut app = App::default();
         app.on_action(Action::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn status_auto_clears_after_ttl() {
+        let mut app = App::default();
+        app.set_status("hello");
+        assert_eq!(app.status.as_deref(), Some("hello"));
+        assert_eq!(app.status_level, StatusLevel::Info);
+        // Tick out its whole lifetime; it should be gone and back to Info.
+        for _ in 0..App::STATUS_TTL_TICKS {
+            app.tick_status();
+        }
+        assert!(app.status.is_none());
+        assert_eq!(app.status_level, StatusLevel::Info);
+    }
+
+    #[test]
+    fn set_error_marks_error_level() {
+        let mut app = App::default();
+        app.set_error("boom");
+        assert_eq!(app.status.as_deref(), Some("boom"));
+        assert_eq!(app.status_level, StatusLevel::Error);
+        assert!(app.status_ticks > 0);
     }
 
     fn page(ids: &[&str], p: u32, total_pages: u32, total: u32) -> CatalogPage {
