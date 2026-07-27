@@ -1685,12 +1685,37 @@ async fn resolve_and_prepare(
     episode: &EpisodeId,
 ) -> Result<Vec<PreparedSource>> {
     let sources = resolve_sources(provider, anime, episode).await?;
+    // Diagnostic: with ANIME_TUI_DUMP set, save each embed page so host resolvers can
+    // be written/verified from real samples. Best-effort, never affects playback.
+    if std::env::var_os("ANIME_TUI_DUMP").is_some() {
+        dump_embed_pages(client, &sources).await;
+    }
     // Resolve host-specific embeds concurrently; failures leave the source unchanged
     // (mpv's ytdl hook then gets a chance at the embed URL).
     Ok(futures::future::join_all(
         sources.into_iter().map(|s| resolve_host_source(client, s)),
     )
     .await)
+}
+
+/// Save each source's embed URL + fetched HTML under `<tmp>/anime-tui-dump/` for
+/// building host resolvers from real fixtures. Enabled by the `ANIME_TUI_DUMP` env
+/// var. Best-effort; ignores all errors.
+async fn dump_embed_pages(client: &reqwest::Client, sources: &[PreparedSource]) {
+    let dir = std::env::temp_dir().join("anime-tui-dump");
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let mut manifest = String::new();
+    for (i, s) in sources.iter().enumerate() {
+        let host = s.label.clone().unwrap_or_else(|| format!("src{i}"));
+        let safe: String = host.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        manifest.push_str(&format!("{host}\t{}\n", s.url));
+        if let Ok(resp) = client.get(&s.url).header("Referer", "https://nakanime.tv/").send().await {
+            if let Ok(body) = resp.text().await {
+                let _ = tokio::fs::write(dir.join(format!("{i}-{safe}.html")), body).await;
+            }
+        }
+    }
+    let _ = tokio::fs::write(dir.join("sources.txt"), manifest).await;
 }
 
 /// For hosts we support natively, fetch the embed page and rewrite the source to a
