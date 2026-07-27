@@ -77,9 +77,12 @@ cargo run --bin anime-tui          # interactive TUI (uses the mock provider unt
 
 With no `base_url` configured it runs against an offline mock catalogue so you
 can exercise search → details → episodes → playback. `/` to search, `j/k` to
-move, `Enter` to drill in, `q` to quit. Selecting an episode launches mpv in a
-standalone window by default; set `embedded_player = true` for in-terminal
-(Kitty) playback.
+move, `Enter` to drill in, `q` to quit. The results list **paginates as you
+scroll** (the header shows `shown/total · sort`); `S` cycles the sort order
+(re-queried from the server) and `F` opens a **quick-filter** that narrows the
+loaded results locally (`Enter` keeps it, `Esc` clears). Selecting an episode
+launches mpv in a standalone window by default; set `embedded_player = true` for
+in-terminal (Kitty) playback.
 
 On a Kitty-graphics terminal (Kitty/Ghostty/WezTerm) the details page shows the
 anime's **cover art** (fetched once and cached under the cache dir). During

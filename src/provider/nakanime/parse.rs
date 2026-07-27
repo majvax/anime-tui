@@ -24,16 +24,21 @@
 //! ```
 
 use crate::errors::{provider_changed, Error, Result};
-use crate::models::{AnimeDetails, AnimeId, AnimeSummary, Episode, EpisodeId, PlayableSource, Quality};
+use crate::models::{
+    AnimeDetails, AnimeId, AnimeSummary, CatalogPage, Episode, EpisodeId, PlayableSource, Quality,
+};
 use serde_json::Value;
 
-pub fn parse_catalog(json: &str) -> Result<Vec<AnimeSummary>> {
+/// Parse a catalogue page: the `data` array plus the `meta` pagination block.
+/// A missing/empty `meta` is tolerated — `page`/`total_pages` default to `1` and
+/// `total` to the number of items returned.
+pub fn parse_catalog_page(json: &str) -> Result<CatalogPage> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| provider_changed("catalog", format!("not valid JSON: {e}")))?;
     let arr = v["data"]
         .as_array()
         .ok_or_else(|| provider_changed("catalog", "missing 'data' array"))?;
-    Ok(arr
+    let items: Vec<AnimeSummary> = arr
         .iter()
         .map(|item| AnimeSummary {
             id: AnimeId(item["id"].as_str().unwrap_or_default().to_string()),
@@ -41,7 +46,18 @@ pub fn parse_catalog(json: &str) -> Result<Vec<AnimeSummary>> {
             poster_url: item["poster_url"].as_str().map(str::to_string),
             year: item["season_year"].as_u64().map(|y| y as u16),
         })
-        .collect())
+        .collect();
+    let meta = &v["meta"];
+    let page = meta["page"].as_u64().unwrap_or(1) as u32;
+    let total_pages = meta["total_pages"].as_u64().unwrap_or(1).max(1) as u32;
+    let total = meta["total"].as_u64().unwrap_or(items.len() as u64) as u32;
+    Ok(CatalogPage { items, page, total_pages, total })
+}
+
+/// Convenience: just the items from a catalogue page (used where pagination is
+/// irrelevant, e.g. the trait's default `search`).
+pub fn parse_catalog(json: &str) -> Result<Vec<AnimeSummary>> {
+    Ok(parse_catalog_page(json)?.items)
 }
 
 /// Extract the inline anime JSON from a Nakanime detail HTML page.
@@ -187,6 +203,25 @@ mod tests {
         assert_eq!(items[0].title, "Shingeki no Kyojin");
         assert_eq!(items[0].poster_url.as_deref(), Some("https://img.example.com/p.jpg"));
         assert_eq!(items[0].year, Some(2013));
+    }
+
+    #[test]
+    fn parse_catalog_page_reads_meta() {
+        let json = r#"{"data":[{"id":"1","title":"A"}],"meta":{"total":2797,"page":2,"per_page":32,"total_pages":88}}"#;
+        let page = parse_catalog_page(json).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.total_pages, 88);
+        assert_eq!(page.total, 2797);
+    }
+
+    #[test]
+    fn parse_catalog_page_defaults_when_meta_absent() {
+        // Empty meta → single page, total derived from item count.
+        let page = parse_catalog_page(r#"{"data":[{"id":"1","title":"A"},{"id":"2","title":"B"}],"meta":{}}"#).unwrap();
+        assert_eq!(page.page, 1);
+        assert_eq!(page.total_pages, 1);
+        assert_eq!(page.total, 2);
     }
 
     // --- anime details ---

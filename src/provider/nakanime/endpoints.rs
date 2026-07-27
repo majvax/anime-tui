@@ -12,6 +12,28 @@ pub const CATALOG_SORT_DEFAULT: &str = "relevance";
 pub const CATALOG_PER_PAGE: u32 = 32;
 pub const CATALOG_KEYWORD_PARAM: &str = "q";
 
+/// Confirmed valid values for the catalogue `sort` query parameter. Any `sort`
+/// forwarded to the server MUST be one of these — unknown values fall back to
+/// [`CATALOG_SORT_DEFAULT`] so we never send an unvalidated parameter.
+pub const CATALOG_SORTS: &[&str] = &[
+    "relevance",
+    "title_asc",
+    "year_desc",
+    "year_asc",
+    "popularity",
+    "trending",
+    "score",
+];
+
+/// Return `sort` if it is a known-valid catalogue sort, else [`CATALOG_SORT_DEFAULT`].
+pub fn validated_sort(sort: &str) -> &'static str {
+    CATALOG_SORTS
+        .iter()
+        .copied()
+        .find(|s| *s == sort)
+        .unwrap_or(CATALOG_SORT_DEFAULT)
+}
+
 /// Anime detail HTML page. `GET /anime/{id}` → 302 → `/anime/{id}/{slug}` (reqwest follows
 /// redirect automatically). Anime JSON is embedded in an inline `<script>` tag as
 /// `{"anime": {...}, "watchedEpisodes": [...], ...}`.
@@ -45,5 +67,14 @@ mod tests {
     fn id_substitution() {
         assert_eq!(with_id(ANIME_PAGE_PATH, "279"), "/anime/279");
         assert_eq!(with_id(SOURCES_PATH, "42"), "/api/sources/anime");
+    }
+
+    #[test]
+    fn sort_is_validated_against_allowlist() {
+        assert_eq!(validated_sort("year_desc"), "year_desc");
+        assert_eq!(validated_sort("popularity"), "popularity");
+        // Unknown / injected values fall back to the default.
+        assert_eq!(validated_sort("../etc"), CATALOG_SORT_DEFAULT);
+        assert_eq!(validated_sort(""), CATALOG_SORT_DEFAULT);
     }
 }

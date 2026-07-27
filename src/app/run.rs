@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::errors::{Error, Result};
 use crate::input::default_binding;
-use crate::models::{AnimeDetails, AnimeId, AnimeSummary, EpisodeId};
+use crate::models::{AnimeDetails, AnimeId, AnimeSummary, CatalogPage, EpisodeId};
 use crate::player::embedded::{EmbeddedPlayer, ProgressUpdate};
 use crate::player::kitty::{CellRect, DELETE_ALL_IMAGES};
 use crate::player::{self, Backend};
@@ -41,7 +41,10 @@ struct PreparedSource {
 
 /// Results delivered from background tasks back into the loop.
 enum Msg {
-    Results(Result<Vec<AnimeSummary>>),
+    /// First page of a fresh catalogue query (replaces the list).
+    Results(Result<CatalogPage>),
+    /// A subsequent catalogue page (appended for infinite scroll).
+    MoreResults(Result<CatalogPage>),
     Details(Result<AnimeDetails>),
     Favourites(Result<Vec<AnimeSummary>>),
     History(Result<Vec<AnimeSummary>>),
@@ -263,6 +266,9 @@ impl Runner {
             // Keep the browse scroll offset in sync before drawing so the row
             // thumbnails line up with what ratatui renders.
             self.update_list_offset();
+            // Infinite scroll: fetch the next catalogue page as the selection nears
+            // the end of what's loaded.
+            self.maybe_load_more();
 
             // During embedded playback, mpv writes Kitty frames to the same
             // stdout as ratatui. Throttle TUI chrome redraws to once per second
@@ -383,6 +389,42 @@ impl Runner {
         }
         let sel = self.app.results_state.selected().unwrap_or(0);
         self.app.list_offset = keep_in_view(self.app.list_offset, sel, visible, len);
+    }
+
+    /// Fetch the next catalogue page when the selection nears the bottom of the
+    /// loaded results (infinite scroll). Catalogue only (Home/Search) — favourites
+    /// and history are single local-DB lists. Skipped while a quick-filter is
+    /// active (the user is narrowing, not paging) or a page is already in flight.
+    fn maybe_load_more(&mut self) {
+        if !matches!(self.app.view, View::Home | View::Search) {
+            return;
+        }
+        if !self.app.filter.is_empty()
+            || self.app.loading_more
+            || self.app.page >= self.app.total_pages
+        {
+            return;
+        }
+        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let body = ui::browse_body(Rect::new(0, 0, 1, rows));
+        let inner_h = body.height.saturating_sub(2);
+        let visible = (inner_h / ui::ROW_H).max(1) as usize;
+        let len = self.app.results.len();
+        let sel = self.app.results_state.selected().unwrap_or(0);
+        // Trigger within one screen of the end.
+        if sel + visible < len {
+            return;
+        }
+        self.app.loading_more = true;
+        let (query, next, sort) = (
+            self.app.query.clone(),
+            self.app.page + 1,
+            self.app.sort.param(),
+        );
+        let (provider, tx) = (self.provider.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let _ = tx.send(Msg::MoreResults(provider.search_page(&query, next, sort).await));
+        });
     }
 
     /// Concurrent thumbnail fetches allowed (kept moderate to be polite but snappy).
@@ -670,6 +712,26 @@ impl Runner {
     }
 
     fn on_search_key(&mut self, code: KeyCode) {
+        // Quick-filter capture (client-side, live) vs server-search capture.
+        if self.app.filtering {
+            match code {
+                KeyCode::Char(c) => self.app.push_filter_char(c),
+                KeyCode::Backspace => self.app.pop_filter_char(),
+                KeyCode::Enter => {
+                    // Commit: keep the filter applied, leave capture.
+                    self.app.filtering = false;
+                    self.app.input_mode = false;
+                }
+                KeyCode::Esc => {
+                    // Cancel: clear the filter, leave capture.
+                    self.app.clear_filter();
+                    self.app.filtering = false;
+                    self.app.input_mode = false;
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Char(c) => self.app.search_input.push(c),
             KeyCode::Backspace => {
@@ -692,9 +754,12 @@ impl Runner {
         match effect {
             Effect::None => {}
             Effect::Search(query) => {
+                // Record the active query synchronously so paging/sort use it.
+                self.app.query = query.clone();
+                let sort = self.app.sort.param();
                 let (provider, tx) = (self.provider.clone(), self.tx.clone());
                 tokio::spawn(async move {
-                    let _ = tx.send(Msg::Results(provider.search(&query).await));
+                    let _ = tx.send(Msg::Results(provider.search_page(&query, 1, sort).await));
                 });
             }
             Effect::LoadDetails(id) => {
@@ -778,12 +843,19 @@ impl Runner {
 
     async fn on_message(&mut self, msg: Msg) {
         match msg {
-            Msg::Results(Ok(results)) => {
-                self.free_thumb_images(); // bound terminal image memory to one page
-                self.app.set_results(results);
+            Msg::Results(Ok(page)) => {
+                self.free_thumb_images(); // fresh result set: bound terminal image memory
+                self.app.set_page(page, false);
                 self.app.set_status(format!("provider: {} · backend: {:?}", self.provider.name(), self.backend));
             }
             Msg::Results(Err(e)) => self.fail(e),
+            // A further page arrived — append without disturbing existing covers.
+            Msg::MoreResults(Ok(page)) => self.app.set_page(page, true),
+            Msg::MoreResults(Err(e)) => {
+                // Non-fatal: keep the list we have, just surface the reason.
+                self.app.loading_more = false;
+                self.app.set_status(format!("load more failed: {e}"));
+            }
             Msg::Details(Ok(details)) => {
                 // Cache title for history lookups.
                 let _ = self.db.cache_anime(

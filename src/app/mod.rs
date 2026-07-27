@@ -11,7 +11,62 @@ use std::collections::{HashMap, HashSet};
 use ratatui::widgets::ListState;
 
 use crate::input::Action;
-use crate::models::{AnimeDetails, AnimeId, AnimeSummary, EpisodeId};
+use crate::models::{AnimeDetails, AnimeId, AnimeSummary, CatalogPage, EpisodeId};
+
+/// Catalogue ordering. Each maps to a provider-validated `sort` query value; the
+/// server does the sorting so it stays consistent across paginated results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Relevance,
+    TitleAsc,
+    YearDesc,
+    YearAsc,
+    Popularity,
+    Trending,
+    Score,
+}
+
+impl SortMode {
+    /// The provider `sort` query value.
+    pub fn param(self) -> &'static str {
+        match self {
+            SortMode::Relevance => "relevance",
+            SortMode::TitleAsc => "title_asc",
+            SortMode::YearDesc => "year_desc",
+            SortMode::YearAsc => "year_asc",
+            SortMode::Popularity => "popularity",
+            SortMode::Trending => "trending",
+            SortMode::Score => "score",
+        }
+    }
+
+    /// Short human label shown in the browse header.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Relevance => "relevance",
+            SortMode::TitleAsc => "title A→Z",
+            SortMode::YearDesc => "newest",
+            SortMode::YearAsc => "oldest",
+            SortMode::Popularity => "popular",
+            SortMode::Trending => "trending",
+            SortMode::Score => "score",
+        }
+    }
+
+    /// Next mode in the cycle (wraps).
+    pub fn next(self) -> SortMode {
+        match self {
+            SortMode::Relevance => SortMode::TitleAsc,
+            SortMode::TitleAsc => SortMode::YearDesc,
+            SortMode::YearDesc => SortMode::YearAsc,
+            SortMode::YearAsc => SortMode::Popularity,
+            SortMode::Popularity => SortMode::Trending,
+            SortMode::Trending => SortMode::Score,
+            SortMode::Score => SortMode::Relevance,
+        }
+    }
+}
 
 /// One visible line in the Episodes view: either a foldable season header or an
 /// episode belonging to an expanded season. Episodes are indexed into
@@ -92,12 +147,32 @@ pub struct App {
     pub input_mode: bool,
     pub search_input: String,
 
-    /// Catalogue results shown in Home/Search/Favourites/History.
+    /// Catalogue results currently shown on screen: `all_results` after the active
+    /// client-side `filter`. Every renderer/selection reads THIS list.
     pub results: Vec<AnimeSummary>,
+    /// Full fetched accumulation for the current query+sort (all pages loaded so
+    /// far). `results` is derived from this by [`App::recompute_results`].
+    pub all_results: Vec<AnimeSummary>,
     pub results_state: ListState,
     /// Scroll offset (first visible row) for the browse list, kept by the runner so
     /// per-row thumbnail placement matches what's rendered.
     pub list_offset: usize,
+
+    /// Active catalogue query ("" = full catalogue) and pagination cursor, so the
+    /// runner can fetch the next page and the UI can show progress/counts.
+    pub query: String,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total: usize,
+    /// Server-side ordering for catalogue queries.
+    pub sort: SortMode,
+    /// Client-side quick-filter over `all_results` (case-insensitive title match).
+    pub filter: String,
+    /// True while the filter box is capturing text (distinct from `input_mode`'s
+    /// server-search capture).
+    pub filtering: bool,
+    /// True while the next catalogue page is being fetched (shown in the header).
+    pub loading_more: bool,
 
     /// Loaded details for the selected title.
     pub details: Option<AnimeDetails>,
@@ -139,8 +214,17 @@ impl Default for App {
             input_mode: false,
             search_input: String::new(),
             results: Vec::new(),
+            all_results: Vec::new(),
             results_state: ListState::default(),
             list_offset: 0,
+            query: String::new(),
+            page: 1,
+            total_pages: 1,
+            total: 0,
+            sort: SortMode::default(),
+            filter: String::new(),
+            filtering: false,
+            loading_more: false,
             details: None,
             episodes_state: ListState::default(),
             expanded_seasons: HashSet::new(),
@@ -196,6 +280,17 @@ impl App {
                 } else {
                     Effect::None
                 }
+            }
+            // Server-side sort applies only to catalogue queries (Home/Search); it
+            // re-runs the search from page 1 with the new ordering.
+            Action::CycleSort if matches!(self.view, View::Home | View::Search) => self.cycle_sort(),
+            // Client-side quick-filter is available in any browse list.
+            Action::Filter if self.is_browse_view() => {
+                self.filtering = true;
+                self.input_mode = true;
+                self.filter.clear();
+                self.recompute_results();
+                Effect::None
             }
             _ => Effect::None,
         }
@@ -295,11 +390,102 @@ impl App {
         self.results_state.selected().and_then(|i| self.results.get(i))
     }
 
+    /// True for the scrollable browse lists (where filter/sort/thumbnails apply).
+    pub fn is_browse_view(&self) -> bool {
+        matches!(
+            self.view,
+            View::Home | View::Search | View::Favourites | View::History
+        )
+    }
+
+    /// Set a non-paginated result list (favourites/history come from the local DB).
+    /// Resets the catalogue cursor and clears any active filter.
     pub fn set_results(&mut self, results: Vec<AnimeSummary>) {
         self.loading = false;
-        self.results = results;
+        self.loading_more = false;
+        self.query.clear();
+        self.page = 1;
+        self.total_pages = 1;
+        self.total = results.len();
+        self.filter.clear();
+        self.filtering = false;
+        self.all_results = results;
         self.list_offset = 0;
+        self.recompute_results();
         self.results_state.select((!self.results.is_empty()).then_some(0));
+    }
+
+    /// Apply a fetched catalogue page. `append` extends the current accumulation
+    /// (infinite scroll); otherwise it replaces it (fresh search / sort change).
+    pub fn set_page(&mut self, page: CatalogPage, append: bool) {
+        self.loading = false;
+        self.loading_more = false;
+        self.page = page.page;
+        self.total_pages = page.total_pages.max(1);
+        self.total = page.total as usize;
+        if append {
+            self.all_results.extend(page.items);
+        } else {
+            self.all_results = page.items;
+            self.list_offset = 0;
+            self.filter.clear();
+            self.filtering = false;
+        }
+        self.recompute_results();
+        if !append {
+            self.results_state.select((!self.results.is_empty()).then_some(0));
+        }
+    }
+
+    /// Rebuild `results` from `all_results` under the active filter. Server output
+    /// is already ordered, so this only filters. Keeps the selection valid.
+    pub fn recompute_results(&mut self) {
+        let f = self.filter.to_lowercase();
+        self.results = if f.is_empty() {
+            self.all_results.clone()
+        } else {
+            self.all_results
+                .iter()
+                .filter(|a| a.title.to_lowercase().contains(&f))
+                .cloned()
+                .collect()
+        };
+        // Clamp selection + offset to the new length.
+        if self.results.is_empty() {
+            self.results_state.select(None);
+            self.list_offset = 0;
+        } else {
+            let sel = self.results_state.selected().unwrap_or(0).min(self.results.len() - 1);
+            self.results_state.select(Some(sel));
+            if self.list_offset >= self.results.len() {
+                self.list_offset = 0;
+            }
+        }
+    }
+
+    /// Advance the sort order and request a fresh page-1 query with it.
+    pub fn cycle_sort(&mut self) -> Effect {
+        self.sort = self.sort.next();
+        self.loading = true;
+        Effect::Search(self.query.clone())
+    }
+
+    /// Append a char to the quick-filter and re-derive `results` live.
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+        self.recompute_results();
+    }
+
+    /// Delete the last quick-filter char and re-derive `results` live.
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.recompute_results();
+    }
+
+    /// Clear the quick-filter entirely (Esc) and re-derive `results`.
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.recompute_results();
     }
 
     pub fn set_details(&mut self, details: AnimeDetails) {
@@ -645,5 +831,94 @@ mod tests {
         let mut app = App::default();
         app.on_action(Action::Quit);
         assert!(app.should_quit);
+    }
+
+    fn page(ids: &[&str], p: u32, total_pages: u32, total: u32) -> CatalogPage {
+        CatalogPage {
+            items: ids
+                .iter()
+                .map(|id| AnimeSummary {
+                    id: AnimeId((*id).into()),
+                    title: (*id).to_string(),
+                    poster_url: None,
+                    year: None,
+                })
+                .collect(),
+            page: p,
+            total_pages,
+            total,
+        }
+    }
+
+    #[test]
+    fn set_page_replace_then_append() {
+        let mut app = App::default();
+        app.set_page(page(&["a", "b"], 1, 2, 4), false);
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.all_results.len(), 2);
+        assert_eq!(app.total, 4);
+        assert_eq!(app.total_pages, 2);
+        assert_eq!(app.results_state.selected(), Some(0));
+
+        // Appending the next page grows the accumulation, keeps selection.
+        app.results_state.select(Some(1));
+        app.set_page(page(&["c", "d"], 2, 2, 4), true);
+        assert_eq!(app.all_results.len(), 4);
+        assert_eq!(app.results.len(), 4);
+        assert_eq!(app.page, 2);
+        assert_eq!(app.results_state.selected(), Some(1)); // not reset on append
+    }
+
+    #[test]
+    fn filter_narrows_and_clamps_selection() {
+        let mut app = App::default();
+        app.set_page(page(&["Naruto", "Bleach", "Nana"], 1, 1, 3), false);
+        app.results_state.select(Some(2)); // "Nana"
+        app.filter = "na".into();
+        app.recompute_results();
+        // "Naruto" and "Nana" match (case-insensitive).
+        assert_eq!(app.results.len(), 2);
+        // Selection clamped into the shorter list.
+        assert!(app.results_state.selected().unwrap() < 2);
+        app.clear_filter();
+        assert_eq!(app.results.len(), 3);
+    }
+
+    #[test]
+    fn cycle_sort_advances_and_requests_requery() {
+        let mut app = App::default();
+        app.goto(View::Home);
+        app.query = "demon".into();
+        assert_eq!(app.sort, SortMode::Relevance);
+        let eff = app.on_action(Action::CycleSort);
+        assert_eq!(app.sort, SortMode::TitleAsc);
+        assert_eq!(eff, Effect::Search("demon".into()));
+    }
+
+    #[test]
+    fn filter_action_enters_capture_without_changing_view() {
+        let mut app = App::default();
+        app.goto(View::Home);
+        app.on_action(Action::Filter);
+        assert!(app.filtering);
+        assert!(app.input_mode);
+        assert_eq!(app.view, View::Home);
+    }
+
+    #[test]
+    fn sort_mode_param_and_cycle() {
+        assert_eq!(SortMode::YearDesc.param(), "year_desc");
+        assert_eq!(SortMode::TitleAsc.param(), "title_asc");
+        // next() visits all seven and wraps.
+        let mut s = SortMode::Relevance;
+        let mut seen = 1;
+        loop {
+            s = s.next();
+            if s == SortMode::Relevance {
+                break;
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 7);
     }
 }

@@ -5,7 +5,7 @@ use anime_tui::errors::Error;
 use anime_tui::models::{AnimeId, EpisodeId};
 use anime_tui::provider::nakanime::Nakanime;
 use anime_tui::provider::Provider;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn provider_for(server: &MockServer) -> Nakanime {
@@ -68,6 +68,56 @@ async fn search_empty_query_uses_catalog_path() {
 
     let results = provider_for(&server).search("").await.unwrap();
     assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn search_page_sends_page_and_sort_and_reads_meta() {
+    let server = MockServer::start().await;
+    let plain = r#"{"data":[{"id":"5","title":"E","season_year":2020}],"meta":{"total":97,"page":3,"per_page":32,"total_pages":4}}"#;
+    Mock::given(method("GET"))
+        .and(path("/api/catalog/search"))
+        .and(query_param("page", "3"))
+        .and(query_param("sort", "year_desc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(xor_catalog(plain.as_bytes())),
+        )
+        .mount(&server)
+        .await;
+
+    let page = provider_for(&server)
+        .search_page("", 3, "year_desc")
+        .await
+        .unwrap();
+    assert_eq!(page.page, 3);
+    assert_eq!(page.total_pages, 4);
+    assert_eq!(page.total, 97);
+    assert_eq!(page.items.len(), 1);
+}
+
+#[tokio::test]
+async fn search_page_rejects_unknown_sort() {
+    // An unvalidated sort must fall back to the default; the server only sees
+    // sort=relevance, never the injected value.
+    let server = MockServer::start().await;
+    let plain = r#"{"data":[],"meta":{"total":0,"page":1,"per_page":32,"total_pages":1}}"#;
+    Mock::given(method("GET"))
+        .and(path("/api/catalog/search"))
+        .and(query_param("sort", "relevance"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(xor_catalog(plain.as_bytes())),
+        )
+        .mount(&server)
+        .await;
+
+    let page = provider_for(&server)
+        .search_page("", 1, "../etc/passwd")
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
 }
 
 // ---- details ----

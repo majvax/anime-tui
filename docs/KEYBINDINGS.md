@@ -15,7 +15,14 @@ from `[keys]` in config.toml in a later phase.
 | `Enter`        | Select / drill in |
 | `Esc`          | Back              |
 | `/`            | Search            |
+| `Tab`          | Switch tab (Home / Favourites / History) |
 | `f`            | Toggle favourite  |
+| `S`            | Cycle sort order (catalogue) |
+| `F`            | Quick-filter loaded results (Enter keeps, Esc clears) |
+
+Catalogue results paginate automatically: scrolling near the bottom loads the
+next page (the header shows `shown/total · sort`). Sort (`S`) re-queries from the
+server; the quick-filter (`F`) narrows the already-loaded results locally.
 
 ## Player
 

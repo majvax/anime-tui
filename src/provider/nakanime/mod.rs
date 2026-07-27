@@ -263,27 +263,27 @@ impl Provider for Nakanime {
         "nakanime"
     }
 
-    async fn search(&self, query: &str) -> Result<Vec<AnimeSummary>> {
-        let path = if query.is_empty() {
-            format!(
-                "{}?sort={}&per_page={}&page=1",
-                endpoints::CATALOG_SEARCH_PATH,
-                endpoints::CATALOG_SORT_DEFAULT,
-                endpoints::CATALOG_PER_PAGE,
-            )
-        } else {
-            format!(
-                "{}?sort={}&per_page={}&page=1&{}={}",
-                endpoints::CATALOG_SEARCH_PATH,
-                endpoints::CATALOG_SORT_DEFAULT,
-                endpoints::CATALOG_PER_PAGE,
+    async fn search_page(&self, query: &str, page: u32, sort: &str) -> Result<CatalogPage> {
+        // Only ever forward a known-valid sort value to the server.
+        let sort = endpoints::validated_sort(sort);
+        let page = page.max(1);
+        let mut path = format!(
+            "{}?sort={}&per_page={}&page={}",
+            endpoints::CATALOG_SEARCH_PATH,
+            sort,
+            endpoints::CATALOG_PER_PAGE,
+            page,
+        );
+        if !query.is_empty() {
+            path.push_str(&format!(
+                "&{}={}",
                 endpoints::CATALOG_KEYWORD_PARAM,
                 urlencode(query),
-            )
-        };
+            ));
+        }
         let body = self.get_bytes(&path).await?;
         let json = dynamic_decrypt("catalog", &body, b"{\"data\":[")?;
-        parse::parse_catalog(&json)
+        parse::parse_catalog_page(&json)
     }
 
     async fn details(&self, id: &AnimeId) -> Result<AnimeDetails> {

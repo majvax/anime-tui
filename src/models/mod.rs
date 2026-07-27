@@ -19,6 +19,17 @@ pub struct AnimeSummary {
     pub year: Option<u16>,
 }
 
+/// One page of catalogue results plus the pagination metadata the browse UI needs
+/// to know whether more pages exist (`page < total_pages`) and how many titles the
+/// query matched in total (`total`).
+#[derive(Debug, Clone)]
+pub struct CatalogPage {
+    pub items: Vec<AnimeSummary>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnimeDetails {
     pub id: AnimeId,

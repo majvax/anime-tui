@@ -67,15 +67,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.loading {
         " loading... ".to_string()
+    } else if app.input_mode && app.filtering {
+        format!(" filter: {}|  (Enter keep · Esc clear)", app.filter)
     } else if app.input_mode {
         format!(" search: {}|", app.search_input)
     } else {
         let hint = match app.view {
             View::Home | View::Search => {
-                " / search · j/k move · Enter select · Tab switch tab · q quit"
+                " / search · j/k move · Enter select · S sort · F filter · Tab tab · q quit"
             }
             View::Favourites | View::History => {
-                " j/k move · Enter select · Tab switch tab · Esc back · q quit"
+                " j/k move · Enter select · F filter · Tab tab · Esc back · q quit"
             }
             View::Details => " Enter episodes · f toggle favourite · Esc back · q quit",
             View::Episodes => " Enter play / fold season · j/k move · Esc back · q quit",
@@ -90,12 +92,28 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).style(Style::default().dim()), area);
 }
 
-fn render_list(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.view {
-        View::Favourites => " Favourites ",
-        View::History => " History ",
-        _ => " Results ",
+/// Browse-list block title: base label plus filter/count/sort/loading context.
+fn browse_title(app: &App) -> String {
+    let base = match app.view {
+        View::Favourites => "Favourites",
+        View::History => "History",
+        _ => "Results",
     };
+    let shown = app.results.len();
+    if app.filtering || !app.filter.is_empty() {
+        return format!(" {base} — filter '{}': {shown} shown ", app.filter);
+    }
+    // Catalogue views show pagination/sort context; local lists just a count.
+    if matches!(app.view, View::Home | View::Search) {
+        let more = if app.loading_more { " · loading more…" } else { "" };
+        format!(" {base} — {shown}/{} · {}{more} ", app.total, app.sort.label())
+    } else {
+        format!(" {base} ({shown}) ")
+    }
+}
+
+fn render_list(frame: &mut Frame, app: &App, area: Rect) {
+    let title = browse_title(app);
 
     if app.results.is_empty() {
         let msg = match app.view {

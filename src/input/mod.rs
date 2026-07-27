@@ -19,6 +19,10 @@ pub enum Action {
     Search,
     Tab,
     ToggleFavourite,
+    /// Cycle catalogue sort order (browse views).
+    CycleSort,
+    /// Enter the client-side quick-filter capture (browse views).
+    Filter,
     // Playback
     PlayPause,
     SeekForward,
@@ -51,6 +55,8 @@ pub fn default_binding(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         Char('/') => Action::Search,
         Tab => Action::Tab,
         Char('f') => Action::ToggleFavourite,
+        Char('S') => Action::CycleSort,
+        Char('F') => Action::Filter,
         Char(' ') => Action::PlayPause,
         Char('m') => Action::Mute,
         Char('n') => Action::NextEpisode,
@@ -70,6 +76,12 @@ mod tests {
     fn vim_keys_map_to_motion() {
         assert_eq!(default_binding(KeyCode::Char('j'), KeyModifiers::NONE), Some(Action::Down));
         assert_eq!(default_binding(KeyCode::Char('k'), KeyModifiers::NONE), Some(Action::Up));
+    }
+
+    #[test]
+    fn sort_and_filter_bindings() {
+        assert_eq!(default_binding(KeyCode::Char('S'), KeyModifiers::NONE), Some(Action::CycleSort));
+        assert_eq!(default_binding(KeyCode::Char('F'), KeyModifiers::NONE), Some(Action::Filter));
     }
 
     #[test]
