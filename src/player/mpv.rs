@@ -113,12 +113,21 @@ pub fn build_args(
     // slower CDNs like sibnet). `--cache=yes` forces the cache on for all inputs.
     args.push("--cache=yes".into());
 
+    // Whether `url` is already a direct media stream (we resolved the embed host
+    // ourselves). If so mpv must play it VERBATIM: running the ytdl hook on a
+    // tokenized HLS/mp4 URL re-fetches/mangles it and fails ("[ytdl_hook] youtube-dl
+    // failed" → exit 2). Only page URLs (e.g. ok.ru) still need the ytdl hook.
+    let direct = is_direct_media(url);
+    if direct {
+        args.push("--ytdl=no".into());
+    }
+
     match presentation {
         Presentation::External { input_conf } => {
-            // Standalone window. If mpv is handed a page URL (yt-dlp pre-resolution
-            // failed) let its ytdl hook pick the best stream; when it already gets
-            // a direct URL — the fast path — this is a harmless no-op.
-            args.push("--ytdl-format=bestvideo+bestaudio/best".into());
+            // Only let mpv's ytdl hook resolve when we handed it a page URL.
+            if !direct {
+                args.push("--ytdl-format=bestvideo+bestaudio/best".into());
+            }
             // The window keeps mpv's default bindings (mouse, OSC seek bar); our
             // conf overrides the specific keys to match the TUI.
             if let Some(path) = input_conf {
@@ -181,6 +190,13 @@ pub fn build_args(
     args.push("--".into());
     args.push(url.to_string());
     args
+}
+
+/// True when `url` already points at a direct media stream (HLS/mp4/mkv), ignoring
+/// any query string — so mpv should play it without invoking its ytdl hook.
+fn is_direct_media(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    path.ends_with(".m3u8") || path.ends_with(".mp4") || path.ends_with(".mkv")
 }
 
 /// A single JSON-IPC command line (newline-terminated) for mpv's socket.
@@ -260,6 +276,30 @@ mod tests {
         assert!(a.iter().any(|s| s == "--vo-kitty-cols=40"));
         assert!(a.iter().any(|s| s == "--vo-kitty-left=3"));
         assert!(a.iter().any(|s| s == "--vo-kitty-alt-screen=no"));
+    }
+
+    #[test]
+    fn direct_stream_disables_ytdl_hook() {
+        // A resolved HLS/mp4 URL plays verbatim: --ytdl=no, no ytdl-format.
+        let a = build_args(
+            "https://cdn/x/master.m3u8?t=tok",
+            "/tmp/s",
+            &Presentation::External { input_conf: None },
+            &[],
+            &MpvTuning::high_quality(),
+        );
+        assert!(a.iter().any(|s| s == "--ytdl=no"));
+        assert!(!a.iter().any(|s| s.starts_with("--ytdl-format")));
+        // A page URL still gets the ytdl hook to resolve it.
+        let b = build_args(
+            "https://ok.ru/videoembed/123",
+            "/tmp/s",
+            &Presentation::External { input_conf: None },
+            &[],
+            &MpvTuning::high_quality(),
+        );
+        assert!(!b.iter().any(|s| s == "--ytdl=no"));
+        assert!(b.iter().any(|s| s == "--ytdl-format=bestvideo+bestaudio/best"));
     }
 
     #[test]
