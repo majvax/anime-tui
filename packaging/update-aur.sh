@@ -14,7 +14,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="majvax/anime-tui"
 target="x86_64-unknown-linux-musl"
 artifact="anime-tui-${target}.tar.gz"
-url="https://github.com/${repo}/releases/download/v${ver}/${artifact}"
+base="https://github.com/${repo}/releases/download/v${ver}"
+url="${base}/${artifact}"
+# The Release attaches a checksum sidecar named "<archive-basename>.sha256"
+# (i.e. without the .tar.gz), per taiki-e/upload-rust-binary-action.
+sidecar="${base}/anime-tui-${target}.sha256"
 
 bump_pkgver() {
     local dir="$1"
@@ -29,7 +33,7 @@ bump_pkgver "${here}/aur/anime-tui-bin"
 
 echo "--> fetching SHA-256 for ${artifact}"
 # Prefer the .sha256 sidecar uploaded alongside the artifact; fall back to hashing.
-sha="$(curl -fsSL "${url}.sha256" | awk '{print $1}')" || {
+sha="$(curl -fsSL "${sidecar}" | awk '{print $1}')" || {
     echo "    .sha256 sidecar missing, hashing the artifact directly"
     sha="$(curl -fsSL "${url}" | sha256sum | awk '{print $1}')"
 }

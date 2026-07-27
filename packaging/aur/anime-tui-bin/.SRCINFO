@@ -10,6 +10,6 @@ pkgbase = anime-tui-bin
 	provides = anime-tui
 	conflicts = anime-tui
 	source = anime-tui-0.1.0-x86_64-unknown-linux-musl.tar.gz::https://github.com/majvax/anime-tui/releases/download/v0.1.0/anime-tui-x86_64-unknown-linux-musl.tar.gz
-	sha256sums = SKIP
+	sha256sums = 1147eccb5560734cf2eee9ad76749d06f03ced01aa58e0fbda969870bf6c512e
 
 pkgname = anime-tui-bin
