@@ -113,32 +113,59 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // On a Kitty terminal, reserve a small left column on each row for the cover
+    // thumbnail (painted by the run loop) and make rows tall enough to show it.
+    let thumbs = crate::player::kitty::probe_support();
+    let pad = if thumbs { " ".repeat((THUMB_COLS + 1) as usize) } else { String::new() };
+
     let items: Vec<ListItem> = app
         .results
         .iter()
         .map(|a| {
             let year = a.year.map(|y| format!(" ({y})")).unwrap_or_default();
-            ListItem::new(format!("{}{}", a.title, year))
+            if thumbs {
+                // ROW_H lines tall: title, dim year, then blanks — text offset past
+                // the thumbnail column so it never overlaps the image.
+                let mut lines = vec![Line::from(format!("{pad}{}", a.title))];
+                if !year.is_empty() {
+                    lines.push(Line::from(format!("{pad}{}", year.trim())).dim());
+                }
+                while lines.len() < ROW_H as usize {
+                    lines.push(Line::from(""));
+                }
+                ListItem::new(lines)
+            } else {
+                ListItem::new(format!("{}{}", a.title, year))
+            }
         })
         .collect();
 
     let list = List::new(items)
         .block(Block::default().title(title).borders(Borders::ALL))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    let mut state = app.results_state.clone();
+    // Control the scroll so it matches the runner's `list_offset` (used to place
+    // the row thumbnails). No highlight symbol — the thumbnail column owns the left.
+    let mut state = app
+        .results_state
+        .clone()
+        .with_offset(if thumbs { app.list_offset } else { 0 });
     frame.render_stateful_widget(list, area, &mut state);
 }
+
+/// Thumbnail column width (cells) and per-row height (rows) in the browse list.
+/// Bigger rows → bigger covers, fewer titles per screen.
+pub const THUMB_COLS: u16 = 8;
+pub const ROW_H: u16 = 5;
 
 fn render_details(frame: &mut Frame, app: &App, area: Rect) {
     let Some(d) = &app.details else {
         frame.render_widget(centered("loading details...", true), area);
         return;
     };
-    // Reserve the poster column (painted by the run loop, never overpainted here)
-    // and put the metadata to its right. Full width when there's no poster.
-    let meta_area = match poster_in_body(area) {
+    // Reserve the poster column on the LEFT (painted by the run loop, never
+    // overpainted here); metadata goes to its right. Full width when no poster.
+    let meta_area = match side_poster(area, false) {
         Some(p) => Rect {
             x: area.x + p.width + 2,
             y: area.y,
@@ -190,15 +217,16 @@ fn cell_pixel_size() -> (u16, u16) {
     (0, 0)
 }
 
-/// The poster rectangle (in cells) within the details `body` area, or `None` when
-/// there's no Kitty support or the terminal is too small.
+/// The poster rect (in cells) on one side of `body`, or `None` when there's no
+/// Kitty support or the terminal is too small. `right` places it against the
+/// right edge; otherwise the left edge (details page uses the left).
 ///
-/// Responsive: the poster is the LARGEST aspect-correct (~2:3) cover that fits the
-/// left side — capped to ~55% width and to leaving [`MIN_INFO_COLS`] for the info —
-/// so it grows to fill roughly the left half on big terminals and shrinks (or
-/// disappears) on small ones. Shared by `render_details` (reserves it) and
-/// `poster_rect` (transmits into it) so the two never disagree.
-fn poster_in_body(body: Rect) -> Option<Rect> {
+/// Responsive: the poster is the LARGEST aspect-correct (~2:3) cover that fits —
+/// capped to ~55% width and to leaving [`MIN_INFO_COLS`] for the text — so it grows
+/// on big terminals and disappears on small ones. Shared by `render_details` (which
+/// reserves the column) and `details_poster_rect` (which the run loop transmits into)
+/// so the two never disagree.
+fn side_poster(body: Rect, right: bool) -> Option<Rect> {
     if !crate::player::kitty::probe_support() {
         return None;
     }
@@ -207,61 +235,71 @@ fn poster_in_body(body: Rect) -> Option<Rect> {
         (0, _) | (_, 0) => (1u32, 2u32),
         (w, h) => (w as u32, h as u32),
     };
-    poster_geometry(body, cw, ch)
+    let (cols, rows) = poster_size(body, cw, ch)?;
+    Some(place_poster(body, cols, rows, right))
 }
 
-/// Pure sizing: the largest 2:3 poster rect fitting the left of `body`, given
-/// pixels-per-cell `(cw, ch)`. Env-free so it's unit-testable.
-fn poster_geometry(body: Rect, cw: u32, ch: u32) -> Option<Rect> {
+/// Position a `cols × rows` poster against the left or right edge of `body`.
+fn place_poster(body: Rect, cols: u16, rows: u16, right: bool) -> Rect {
+    let x = if right {
+        body.x + body.width.saturating_sub(cols)
+    } else {
+        body.x
+    };
+    Rect { x, y: body.y, width: cols, height: rows }
+}
+
+/// Pure sizing: the (cols, rows) of the largest 2:3 poster fitting `body`, given
+/// pixels-per-cell `(cw, ch)`. Env-free and side-agnostic → unit-testable.
+fn poster_size(body: Rect, cw: u32, ch: u32) -> Option<(u16, u16)> {
     if body.width < MIN_POSTER_COLS + MIN_INFO_COLS + 2 || body.height < 10 {
-        return None; // keep the details text readable on small terminals
+        return None; // keep the text readable on small terminals
     }
     let (bw, bh) = (body.width as u32, body.height as u32);
 
     // Width (cells) of a 2:3 poster that is exactly `body.height` tall.
     let height_limited = ((bh * ch) * 2 / 3) / cw.max(1);
-    // Width cap: at most ~55% of the body, and always leave MIN_INFO_COLS for info.
+    // Width cap: at most ~55% of the body, and always leave MIN_INFO_COLS for text.
     let width_cap = (bw * 55 / 100).min(bw.saturating_sub(MIN_INFO_COLS as u32 + 2));
     let cols = height_limited.min(width_cap).max(MIN_POSTER_COLS as u32);
     // Rows back-derived from the chosen width so it stays 2:3 and never overflows.
     let rows = (((cols * cw) * 3 / 2) / ch.max(1)).min(bh);
 
-    Some(Rect {
-        x: body.x,
-        y: body.y,
-        width: cols as u16,
-        height: rows.max(3) as u16,
-    })
+    Some((cols as u16, rows.max(3) as u16))
 }
 
-/// The poster cell rect the run loop transmits the image into. MUST match the
-/// column reserved by [`render_details`]. Empty when no poster should show.
-pub fn poster_rect(area: Rect) -> CellRect {
-    let body = Layout::vertical([
+/// The body area (between header and footer) of the full terminal `area`.
+fn body_of(area: Rect) -> Rect {
+    Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .split(area)[1];
-    match poster_in_body(body) {
-        Some(r) => {
-            let (cw, ch) = cell_pixel_size();
-            let (pw, ph) = if cw > 0 && ch > 0 {
-                (Some(r.width.saturating_mul(cw)), Some(r.height.saturating_mul(ch)))
-            } else {
-                (None, None)
-            };
-            CellRect {
-                left: r.x,
-                top: r.y,
-                cols: r.width,
-                rows: r.height,
-                pixel_width: pw,
-                pixel_height: ph,
-            }
-        }
-        None => CellRect { left: 0, top: 0, cols: 0, rows: 0, pixel_width: None, pixel_height: None },
-    }
+    .split(area)[1]
+}
+
+fn to_cellrect(r: Rect) -> CellRect {
+    let (cw, ch) = cell_pixel_size();
+    let (pw, ph) = if cw > 0 && ch > 0 {
+        (Some(r.width.saturating_mul(cw)), Some(r.height.saturating_mul(ch)))
+    } else {
+        (None, None)
+    };
+    CellRect { left: r.x, top: r.y, cols: r.width, rows: r.height, pixel_width: pw, pixel_height: ph }
+}
+
+const EMPTY_CELLRECT: CellRect =
+    CellRect { left: 0, top: 0, cols: 0, rows: 0, pixel_width: None, pixel_height: None };
+
+/// Details-page poster rect (LEFT). MUST match `render_details`'s reserved column.
+pub fn details_poster_rect(area: Rect) -> CellRect {
+    side_poster(body_of(area), false).map(to_cellrect).unwrap_or(EMPTY_CELLRECT)
+}
+
+/// The body area (between header and footer) of the full terminal `area` — used by
+/// the runner to place per-row browse thumbnails against `render_list`'s layout.
+pub fn browse_body(area: Rect) -> Rect {
+    body_of(area)
 }
 
 fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
@@ -470,20 +508,31 @@ mod tests {
     }
 
     #[test]
-    fn poster_geometry_is_responsive() {
+    fn poster_size_is_responsive() {
         // Too small → no poster.
-        assert!(poster_geometry(Rect::new(0, 0, 40, 20), 1, 2).is_none());
-        assert!(poster_geometry(Rect::new(0, 0, 120, 8), 1, 2).is_none());
+        assert!(poster_size(Rect::new(0, 0, 40, 20), 1, 2).is_none());
+        assert!(poster_size(Rect::new(0, 0, 120, 8), 1, 2).is_none());
 
         // Wide body → sizeable poster, capped to ~55% and leaving room for info.
-        let big = poster_geometry(Rect::new(0, 0, 200, 50), 1, 2).unwrap();
-        assert!(big.width >= MIN_POSTER_COLS);
-        assert!(big.width <= 200 * 55 / 100);
-        assert!(200 - big.width - 2 >= MIN_INFO_COLS); // info column stays readable
-        assert!(big.height <= 50); // never overflows the body vertically
+        let (bw, bh) = poster_size(Rect::new(0, 0, 200, 50), 1, 2).unwrap();
+        assert!(bw >= MIN_POSTER_COLS);
+        assert!(bw <= 200 * 55 / 100);
+        assert!(200 - bw - 2 >= MIN_INFO_COLS); // text column stays readable
+        assert!(bh <= 50); // never overflows the body vertically
 
         // Growing the terminal grows the poster (responsive).
-        let small = poster_geometry(Rect::new(0, 0, 80, 24), 1, 2).unwrap();
-        assert!(big.width >= small.width);
+        let (sw, _) = poster_size(Rect::new(0, 0, 80, 24), 1, 2).unwrap();
+        assert!(bw >= sw);
+    }
+
+    #[test]
+    fn place_poster_aligns_to_edge() {
+        let body = Rect::new(0, 0, 200, 50);
+        let (cols, rows) = poster_size(body, 1, 2).unwrap();
+        let left = place_poster(body, cols, rows, false);
+        let right = place_poster(body, cols, rows, true);
+        assert_eq!(left.x, body.x);
+        assert_eq!(right.x, body.x + body.width - cols);
+        assert!(right.x > left.x); // right pane sits past the left
     }
 }

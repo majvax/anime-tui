@@ -19,7 +19,7 @@ use crate::errors::{Error, Result};
 use crate::input::default_binding;
 use crate::models::{AnimeDetails, AnimeId, AnimeSummary, EpisodeId};
 use crate::player::embedded::{EmbeddedPlayer, ProgressUpdate};
-use crate::player::kitty::DELETE_ALL_IMAGES;
+use crate::player::kitty::{CellRect, DELETE_ALL_IMAGES};
 use crate::player::{self, Backend};
 use crate::provider::Provider;
 use crate::terminal::TerminalGuard;
@@ -61,8 +61,13 @@ enum Msg {
         episode: EpisodeId,
         sources: Vec<PreparedSource>,
     },
-    /// Fetched + decoded + re-encoded poster PNG for an anime's details page.
+    /// Fetched + decoded poster image, ready to resize to the display box.
     Poster {
+        anime: AnimeId,
+        image: Result<image::DynamicImage>,
+    },
+    /// Fetched + decoded browse-row thumbnail, pre-sized to a small PNG.
+    Thumb {
         anime: AnimeId,
         png: Result<Vec<u8>>,
     },
@@ -105,14 +110,34 @@ pub struct Runner {
 
     /// Seconds the `i` key jumps to skip an opening.
     skip_intro_secs: u64,
-    /// On-disk poster cache directory (posters are also decoded/resized to PNG).
+    /// On-disk cache of raw poster source bytes.
     poster_cache: crate::cache::Cache,
-    /// The current anime's decoded poster PNG, ready to transmit to the terminal.
-    current_poster: Option<(AnimeId, Vec<u8>)>,
+    /// The current poster's decoded image, resized to the display box at transmit.
+    current_poster: Option<(AnimeId, image::DynamicImage)>,
     /// Set when the poster must be (re)painted into its reserved rect.
     poster_dirty: bool,
     /// Whether the poster image is currently placed on screen (for clean removal).
     poster_shown: bool,
+    /// The rect the poster was last transmitted into, so a view switch (left↔right)
+    /// or resize re-places it even when the image content is unchanged.
+    last_poster_rect: Option<CellRect>,
+    /// Anime id whose (details) poster fetch is in flight (at most one at a time).
+    poster_inflight: Option<String>,
+
+    /// Shared HTTP client for poster/thumbnail fetches (connection pooling — the
+    /// per-call `reqwest::get` was the ~2 s cost while browsing).
+    http: reqwest::Client,
+    /// Ready-to-transmit small PNG thumbnails keyed by anime id (browse rows).
+    thumb_cache: std::collections::HashMap<String, Vec<u8>>,
+    /// Thumbnail fetches currently in flight (bounded concurrency).
+    thumb_inflight: std::collections::HashSet<String>,
+    /// Covers transmitted to the terminal (once each): anime id → Kitty image id.
+    thumb_img: std::collections::HashMap<String, u32>,
+    /// Next image id to assign (counts up from `THUMB_ID_BASE`).
+    thumb_next_id: u32,
+    /// Current placement on each visible row slot: slot → image id (placement id is
+    /// `slot + 1`). Scrolling only moves placements, never re-sends image data.
+    placed_slots: std::collections::HashMap<u16, u32>,
 
     /// Set when the video surface must be wiped and the TUI fully repainted
     /// (playback ended / resize). Acted on in `run` where the terminal lives.
@@ -162,6 +187,17 @@ impl Runner {
             current_poster: None,
             poster_dirty: false,
             poster_shown: false,
+            last_poster_rect: None,
+            poster_inflight: None,
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+            thumb_cache: std::collections::HashMap::new(),
+            thumb_inflight: std::collections::HashSet::new(),
+            thumb_img: std::collections::HashMap::new(),
+            thumb_next_id: crate::player::kitty::THUMB_ID_BASE,
+            placed_slots: std::collections::HashMap::new(),
             needs_clear: false,
             last_tui_draw: std::time::Instant::now(),
             tuning: crate::player::mpv::MpvTuning {
@@ -202,7 +238,15 @@ impl Runner {
                 guard.terminal.clear()?;
                 self.needs_clear = false;
                 self.poster_shown = false; // the clear wiped it too
+                // DELETE_ALL_IMAGES freed every thumbnail image + placement; forget them.
+                self.placed_slots.clear();
+                self.thumb_img.clear();
+                self.thumb_next_id = crate::player::kitty::THUMB_ID_BASE;
             }
+
+            // Keep the browse scroll offset in sync before drawing so the row
+            // thumbnails line up with what ratatui renders.
+            self.update_list_offset();
 
             // During embedded playback, mpv writes Kitty frames to the same
             // stdout as ratatui. Throttle TUI chrome redraws to once per second
@@ -214,9 +258,10 @@ impl Runner {
                 self.last_tui_draw = std::time::Instant::now();
             }
 
-            // Paint (or remove) the details-page poster into its reserved rect,
-            // after the TUI draw so ratatui doesn't clobber it.
+            // After the TUI draw (so ratatui doesn't clobber them): the details
+            // poster and the per-row browse thumbnails.
             self.render_poster();
+            self.place_thumbnails();
         }
 
         // Stop any embedded playback cleanly before the guard restores the term.
@@ -246,34 +291,223 @@ impl Runner {
         }
     }
 
-    /// Paint the details-page poster into its reserved rect, or remove it when we
-    /// leave the details page. Called after the TUI draw so it isn't overpainted.
+    /// Paint the details-page poster into its reserved (left) rect, resizing the
+    /// decoded image to the exact box for crispness, or remove it when off the
+    /// details page. Called after the TUI draw so it isn't overpainted.
     fn render_poster(&mut self) {
         use std::io::Write as _;
-        if self.app.view == View::Details {
-            let Some((_, png)) = &self.current_poster else {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let area = Rect::new(0, 0, cols, rows);
+        let rect = if self.app.view == View::Details {
+            ui::details_poster_rect(area)
+        } else {
+            CellRect { left: 0, top: 0, cols: 0, rows: 0, pixel_width: None, pixel_height: None }
+        };
+
+        if !rect.is_empty() {
+            if let Some((_, img)) = &self.current_poster {
+                // Re-place on: content change, first show, or a moved/resized rect
+                // (e.g. switching between the details left pane and browse right pane).
+                let moved = self.last_poster_rect != Some(rect);
+                if self.poster_dirty || !self.poster_shown || moved {
+                    // Resize to the box's exact pixels so the terminal doesn't
+                    // up/down-scale it (Lanczos3 keeps it sharp).
+                    let pw = rect.pixel_width.map(u32::from).unwrap_or(rect.cols as u32 * 8).max(1);
+                    let ph = rect.pixel_height.map(u32::from).unwrap_or(rect.rows as u32 * 16).max(1);
+                    let sized = img.resize_to_fill(pw, ph, image::imageops::FilterType::Lanczos3);
+                    let mut png = std::io::Cursor::new(Vec::new());
+                    if sized.write_to(&mut png, image::ImageFormat::Png).is_ok() {
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(crate::player::kitty::DELETE_POSTER.as_bytes());
+                        let _ = out.write_all(
+                            crate::player::kitty::transmit_png(png.get_ref(), rect).as_bytes(),
+                        );
+                        let _ = out.flush();
+                        self.poster_dirty = false;
+                        self.poster_shown = true;
+                        self.last_poster_rect = Some(rect);
+                    }
+                }
                 return;
-            };
-            if !self.poster_dirty && self.poster_shown {
-                return; // already on screen and unchanged
             }
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            let rect = ui::poster_rect(Rect::new(0, 0, cols, rows));
-            if rect.is_empty() {
-                return;
-            }
-            let mut out = std::io::stdout();
-            let _ = out.write_all(crate::player::kitty::DELETE_POSTER.as_bytes());
-            let _ = out.write_all(crate::player::kitty::transmit_png(png, rect).as_bytes());
-            let _ = out.flush();
-            self.poster_dirty = false;
-            self.poster_shown = true;
-        } else if self.poster_shown {
+        }
+        // No poster to show in this view (or none loaded): remove any placement.
+        if self.poster_shown {
             let mut out = std::io::stdout();
             let _ = out.write_all(crate::player::kitty::DELETE_POSTER.as_bytes());
             let _ = out.flush();
             self.poster_shown = false;
+            self.last_poster_rect = None;
         }
+    }
+
+    /// True when the current view is one of the scrollable browse lists.
+    fn in_browse_view(&self) -> bool {
+        matches!(
+            self.app.view,
+            View::Home | View::Search | View::Favourites | View::History
+        )
+    }
+
+    /// Keep the selected browse row within the visible window by adjusting
+    /// `list_offset` (only scrolls when the selection leaves the window). Must run
+    /// before the draw so `render_list` renders at this offset.
+    fn update_list_offset(&mut self) {
+        if !self.in_browse_view() {
+            return;
+        }
+        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let body = ui::browse_body(Rect::new(0, 0, 1, rows));
+        let inner_h = body.height.saturating_sub(2);
+        let visible = (inner_h / ui::ROW_H).max(1) as usize;
+        let len = self.app.results.len();
+        if len == 0 {
+            self.app.list_offset = 0;
+            return;
+        }
+        let sel = self.app.results_state.selected().unwrap_or(0);
+        self.app.list_offset = keep_in_view(self.app.list_offset, sel, visible, len);
+    }
+
+    /// Concurrent thumbnail fetches allowed (kept moderate to be polite but snappy).
+    const THUMB_FETCH_CAP: usize = 8;
+
+    /// Place a cover thumbnail on each visible browse row (Kitty terminals) and
+    /// eagerly warm the rest, or remove them when off a browse view. Incremental:
+    /// only slots whose content changed are (re)transmitted, so a newly-fetched
+    /// thumbnail pops in instantly and idle frames do no work. Runs after the draw.
+    fn place_thumbnails(&mut self) {
+        let browse = self.in_browse_view() && crate::player::kitty::probe_support();
+        if !browse {
+            self.clear_thumbnails();
+            return;
+        }
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let body = ui::browse_body(Rect::new(0, 0, cols, rows));
+        let (ix, iy) = (body.x + 1, body.y + 1);
+        let (iw, ih) = (body.width.saturating_sub(2), body.height.saturating_sub(2));
+        if iw < ui::THUMB_COLS + 2 || ih < ui::ROW_H {
+            self.clear_thumbnails();
+            return;
+        }
+        let visible = (ih / ui::ROW_H) as usize;
+        let offset = self.app.list_offset;
+        let len = self.app.results.len();
+
+        // Eagerly fetch missing thumbnails — visible rows first, then the rest — so
+        // scrolling finds them cached (instant). Bounded concurrency.
+        let mut to_fetch: Vec<(String, String)> = Vec::new();
+        let order = (offset..(offset + visible).min(len)).chain(0..len);
+        for idx in order {
+            if self.thumb_inflight.len() + to_fetch.len() >= Self::THUMB_FETCH_CAP {
+                break;
+            }
+            let a = &self.app.results[idx];
+            let id = &a.id.0;
+            if !self.thumb_cache.contains_key(id)
+                && !self.thumb_inflight.contains(id)
+                && !to_fetch.iter().any(|(i, _)| i == id)
+            {
+                if let Some(url) = &a.poster_url {
+                    to_fetch.push((id.clone(), url.clone()));
+                }
+            }
+        }
+        for (id, url) in to_fetch {
+            self.fetch_thumb(AnimeId(id), url);
+        }
+
+        let mut out = std::io::stdout();
+        let mut wrote = false;
+
+        // 1) Transmit (once) any visible cover we have cached but haven't sent yet.
+        let mut to_send: Vec<String> = Vec::new();
+        for i in 0..visible {
+            if let Some(a) = self.app.results.get(offset + i) {
+                if self.thumb_cache.contains_key(&a.id.0) && !self.thumb_img.contains_key(&a.id.0) {
+                    to_send.push(a.id.0.clone());
+                }
+            }
+        }
+        for anime in to_send {
+            if let Some(png) = self.thumb_cache.get(&anime) {
+                let id = self.thumb_next_id;
+                self.thumb_next_id += 1;
+                let _ = out.write_all(crate::player::kitty::transmit_data(png, id).as_bytes());
+                self.thumb_img.insert(anime, id);
+                wrote = true;
+            }
+        }
+
+        // 2) Desired placement per slot: slot → image id, for visible transmitted covers.
+        let want: std::collections::HashMap<u16, u32> = (0..visible as u16)
+            .filter_map(|slot| {
+                let a = self.app.results.get(offset + slot as usize)?;
+                self.thumb_img.get(&a.id.0).map(|id| (slot, *id))
+            })
+            .collect();
+
+        // 3) Diff placements (cheap — no image data): scrolling just moves these.
+        let stale: Vec<(u16, u32)> = self
+            .placed_slots
+            .iter()
+            .filter(|(slot, img)| want.get(slot) != Some(img))
+            .map(|(slot, img)| (*slot, *img))
+            .collect();
+        for (slot, img) in stale {
+            let _ = out.write_all(crate::player::kitty::delete_placement(img, (slot + 1) as u32).as_bytes());
+            self.placed_slots.remove(&slot);
+            wrote = true;
+        }
+        for (slot, img) in &want {
+            if self.placed_slots.get(slot) == Some(img) {
+                continue; // already placed here
+            }
+            let rect = CellRect {
+                left: ix,
+                top: iy + slot * ui::ROW_H,
+                cols: ui::THUMB_COLS,
+                rows: ui::ROW_H,
+                pixel_width: None,
+                pixel_height: None,
+            };
+            let _ = out
+                .write_all(crate::player::kitty::place(*img, (slot + 1) as u32, rect).as_bytes());
+            self.placed_slots.insert(*slot, *img);
+            wrote = true;
+        }
+        if wrote {
+            let _ = out.flush();
+        }
+    }
+
+    /// Remove the row-thumbnail PLACEMENTS but keep the transmitted image data, so
+    /// returning to the list re-shows them instantly.
+    fn clear_thumbnails(&mut self) {
+        if self.placed_slots.is_empty() {
+            return;
+        }
+        let mut out = std::io::stdout();
+        for (slot, img) in self.placed_slots.drain() {
+            let _ = out.write_all(crate::player::kitty::delete_placement(img, (slot + 1) as u32).as_bytes());
+        }
+        let _ = out.flush();
+    }
+
+    /// Free every transmitted thumbnail image (data + placements) — called when the
+    /// browse result set changes, so terminal image memory stays bounded to a page.
+    fn free_thumb_images(&mut self) {
+        if self.thumb_img.is_empty() {
+            self.placed_slots.clear();
+            return;
+        }
+        let mut out = std::io::stdout();
+        for id in self.thumb_img.drain().map(|(_, id)| id) {
+            let _ = out.write_all(crate::player::kitty::free_image(id).as_bytes());
+        }
+        let _ = out.flush();
+        self.placed_slots.clear();
+        self.thumb_next_id = crate::player::kitty::THUMB_ID_BASE;
     }
 
     /// Player-view controls go straight to mpv over IPC (embedded); for the
@@ -524,6 +758,7 @@ impl Runner {
     async fn on_message(&mut self, msg: Msg) {
         match msg {
             Msg::Results(Ok(results)) => {
+                self.free_thumb_images(); // bound terminal image memory to one page
                 self.app.set_results(results);
                 self.app.set_status(format!("provider: {} · backend: {:?}", self.provider.name(), self.backend));
             }
@@ -560,9 +795,15 @@ impl Runner {
                 self.app.set_details(details);
             }
             Msg::Details(Err(e)) => self.fail(e),
-            Msg::Favourites(Ok(favs)) => self.app.set_results(favs),
+            Msg::Favourites(Ok(favs)) => {
+                self.free_thumb_images();
+                self.app.set_results(favs);
+            }
             Msg::Favourites(Err(e)) => self.fail(e),
-            Msg::History(Ok(hist)) => self.app.set_results(hist),
+            Msg::History(Ok(hist)) => {
+                self.free_thumb_images();
+                self.app.set_results(hist);
+            }
             Msg::History(Err(e)) => self.fail(e),
             Msg::Resolved { anime, episode, result } => match result {
                 Ok(sources) if sources.is_empty() => {
@@ -636,14 +877,23 @@ impl Runner {
                     self.source_cache.insert(episode.0, sources);
                 }
             }
-            Msg::Poster { anime, png } => {
-                // Only apply if it's still the anime being viewed.
-                let current = self.app.details.as_ref().map(|d| d.id.0.as_str());
-                if current == Some(anime.0.as_str()) {
-                    if let Ok(png) = png {
-                        self.current_poster = Some((anime, png));
+            Msg::Poster { anime, image } => {
+                if self.poster_inflight.as_deref() == Some(anime.0.as_str()) {
+                    self.poster_inflight = None;
+                }
+                // Apply only if it's still the subject being shown (details anime).
+                if self.poster_subject_id().as_deref() == Some(anime.0.as_str()) {
+                    if let Ok(img) = image {
+                        self.current_poster = Some((anime, img));
                         self.poster_dirty = true;
                     }
+                }
+            }
+            Msg::Thumb { anime, png } => {
+                self.thumb_inflight.remove(&anime.0);
+                if let Ok(png) = png {
+                    // Stored → the next `place_thumbnails` pass shows it immediately.
+                    self.thumb_cache.insert(anime.0, png);
                 }
             }
         }
@@ -808,17 +1058,38 @@ impl Runner {
         }
     }
 
-    /// Spawn a background task to fetch/decode/cache an anime's poster (Kitty
-    /// terminals only). Reports `Msg::Poster` when the PNG is ready.
-    fn fetch_poster(&self, anime: AnimeId, url: String) {
+    /// Spawn a background task to fetch/decode/cache an anime's details poster
+    /// (Kitty terminals only). Reports `Msg::Poster` when the decoded image is ready.
+    fn fetch_poster(&mut self, anime: AnimeId, url: String) {
         if !crate::player::kitty::probe_support() {
-            return; // no graphics support → details page stays text-only
+            return; // no graphics support → text-only
         }
-        let cache_path = self.poster_cache.path_for(&format!("{}.png", anime.0));
-        let tx = self.tx.clone();
+        self.poster_inflight = Some(anime.0.clone());
+        let cache_path = self.poster_cache.path_for(&format!("{}.poster", anime.0));
+        let (tx, http) = (self.tx.clone(), self.http.clone());
         tokio::spawn(async move {
-            let png = load_or_fetch_poster(&cache_path, &url).await;
-            let _ = tx.send(Msg::Poster { anime, png });
+            let image = fetch_poster_image(&http, &cache_path, &url).await;
+            let _ = tx.send(Msg::Poster { anime, image });
+        });
+    }
+
+    /// The anime whose (big) poster should currently be shown: the details anime.
+    fn poster_subject_id(&self) -> Option<String> {
+        match self.app.view {
+            View::Details => self.app.details.as_ref().map(|d| d.id.0.clone()),
+            _ => None,
+        }
+    }
+
+    /// Spawn a background task to fetch a small row thumbnail (already sized down),
+    /// reported as `Msg::Thumb`. Bounded concurrency via `thumb_inflight`.
+    fn fetch_thumb(&mut self, anime: AnimeId, url: String) {
+        self.thumb_inflight.insert(anime.0.clone());
+        let cache_path = self.poster_cache.path_for(&format!("{}.thumb", anime.0));
+        let (tx, http) = (self.tx.clone(), self.http.clone());
+        tokio::spawn(async move {
+            let png = fetch_thumb_png(&http, &cache_path, &url).await;
+            let _ = tx.send(Msg::Thumb { anime, png });
         });
     }
 
@@ -987,6 +1258,18 @@ fn current_video_rect(fullscreen: bool) -> crate::player::kitty::CellRect {
     ui::video_rect(Rect::new(0, 0, cols, rows), fullscreen)
 }
 
+/// Minimally adjust `offset` so `selected` stays within `[offset, offset+visible)`,
+/// then clamp so the last page isn't scrolled past the end. Pure → unit-testable.
+fn keep_in_view(mut offset: usize, selected: usize, visible: usize, len: usize) -> usize {
+    let visible = visible.max(1);
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset + visible {
+        offset = selected + 1 - visible;
+    }
+    offset.min(len.saturating_sub(visible))
+}
+
 /// Parse a user-typed time string into seconds.
 /// Accepts: "90" (seconds), "1:30" (mm:ss), "1:02:30" (hh:mm:ss).
 fn parse_time_input(s: &str) -> Option<f64> {
@@ -1078,10 +1361,13 @@ async fn resolve_sources(
     Ok(prepared)
 }
 
-/// Load a poster PNG from the on-disk cache, else fetch the URL, decode, downscale
-/// to a 2:3 cover (Kitty rescales into the cell box on display), re-encode PNG, and
-/// cache it. Returns the PNG bytes ready for `kitty::transmit_png`.
-async fn load_or_fetch_poster(cache_path: &std::path::Path, url: &str) -> Result<Vec<u8>> {
+/// Raw image bytes from the on-disk cache, else fetched from `url` (via the shared
+/// client, for connection reuse) and cached.
+async fn load_or_fetch_bytes(
+    client: &reqwest::Client,
+    cache_path: &std::path::Path,
+    url: &str,
+) -> Result<Vec<u8>> {
     if let Ok(bytes) = tokio::fs::read(cache_path).await {
         if !bytes.is_empty() {
             return Ok(bytes);
@@ -1090,29 +1376,61 @@ async fn load_or_fetch_poster(cache_path: &std::path::Path, url: &str) -> Result
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(Error::InvalidUrl(url.to_string()));
     }
-    let raw = reqwest::get(url)
+    let raw = client
+        .get(url)
+        .send()
         .await
-        .map_err(|e| Error::Network(format!("poster fetch: {e}")))?
+        .map_err(|e| Error::Network(format!("image fetch: {e}")))?
         .bytes()
         .await
-        .map_err(|e| Error::Network(format!("poster body: {e}")))?;
+        .map_err(|e| Error::Network(format!("image body: {e}")))?;
+    let _ = tokio::fs::write(cache_path, &raw).await;
+    Ok(raw.to_vec())
+}
 
-    // Decode + resize on a blocking thread (image work is CPU-bound).
-    let png = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let img = image::load_from_memory(&raw)
+/// Fetch (or load) and decode a poster into a `DynamicImage`, capped to a sane max
+/// so a huge source doesn't blow up memory. Decoding runs on a blocking thread.
+async fn fetch_poster_image(
+    client: &reqwest::Client,
+    cache_path: &std::path::Path,
+    url: &str,
+) -> Result<image::DynamicImage> {
+    let bytes = load_or_fetch_bytes(client, cache_path, url).await?;
+    tokio::task::spawn_blocking(move || -> Result<image::DynamicImage> {
+        let img = image::load_from_memory(&bytes)
             .map_err(|e| Error::Resolve(format!("poster decode: {e}")))?;
-        let cover = img.resize_to_fill(300, 450, image::imageops::FilterType::Triangle);
+        // Plenty of detail for any on-screen box while bounding memory/CPU.
+        let capped = if img.width() > 900 || img.height() > 900 {
+            img.resize(900, 900, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+        Ok(capped)
+    })
+    .await
+    .map_err(|e| Error::Resolve(format!("poster task: {e}")))?
+}
+
+/// Fetch (or load), decode, and downscale a browse thumbnail to a small PNG. Small
+/// + low-res is fine for row thumbnails and keeps it fast.
+async fn fetch_thumb_png(
+    client: &reqwest::Client,
+    cache_path: &std::path::Path,
+    url: &str,
+) -> Result<Vec<u8>> {
+    let bytes = load_or_fetch_bytes(client, cache_path, url).await?;
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let img = image::load_from_memory(&bytes)
+            .map_err(|e| Error::Resolve(format!("thumb decode: {e}")))?;
+        let small = img.resize_to_fill(120, 180, image::imageops::FilterType::Triangle);
         let mut out = std::io::Cursor::new(Vec::new());
-        cover
+        small
             .write_to(&mut out, image::ImageFormat::Png)
-            .map_err(|e| Error::Resolve(format!("poster encode: {e}")))?;
+            .map_err(|e| Error::Resolve(format!("thumb encode: {e}")))?;
         Ok(out.into_inner())
     })
     .await
-    .map_err(|e| Error::Resolve(format!("poster task: {e}")))??;
-
-    let _ = tokio::fs::write(cache_path, &png).await;
-    Ok(png)
+    .map_err(|e| Error::Resolve(format!("thumb task: {e}")))?
 }
 
 /// Resolve an episode AND pre-resolve every source's direct stream URL (in
@@ -1138,4 +1456,23 @@ async fn resolve_and_prepare(
         s.url = u;
     }
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_in_view;
+
+    #[test]
+    fn keep_in_view_scrolls_only_when_needed() {
+        // Selection within the window → offset unchanged.
+        assert_eq!(keep_in_view(0, 3, 10, 100), 0);
+        // Selection below the window → scroll down just enough.
+        assert_eq!(keep_in_view(0, 12, 10, 100), 3); // 12 - 10 + 1
+        // Selection above the window → scroll up to it.
+        assert_eq!(keep_in_view(20, 5, 10, 100), 5);
+        // Clamped so the last page doesn't scroll past the end.
+        assert_eq!(keep_in_view(95, 99, 10, 100), 90);
+        // Fewer items than the window → offset 0.
+        assert_eq!(keep_in_view(0, 2, 10, 3), 0);
+    }
 }

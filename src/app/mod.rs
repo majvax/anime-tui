@@ -95,6 +95,9 @@ pub struct App {
     /// Catalogue results shown in Home/Search/Favourites/History.
     pub results: Vec<AnimeSummary>,
     pub results_state: ListState,
+    /// Scroll offset (first visible row) for the browse list, kept by the runner so
+    /// per-row thumbnail placement matches what's rendered.
+    pub list_offset: usize,
 
     /// Loaded details for the selected title.
     pub details: Option<AnimeDetails>,
@@ -137,6 +140,7 @@ impl Default for App {
             search_input: String::new(),
             results: Vec::new(),
             results_state: ListState::default(),
+            list_offset: 0,
             details: None,
             episodes_state: ListState::default(),
             expanded_seasons: HashSet::new(),
@@ -294,6 +298,7 @@ impl App {
     pub fn set_results(&mut self, results: Vec<AnimeSummary>) {
         self.loading = false;
         self.results = results;
+        self.list_offset = 0;
         self.results_state.select((!self.results.is_empty()).then_some(0));
     }
 

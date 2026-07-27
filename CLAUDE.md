@@ -119,12 +119,20 @@ defaults to it when `base_url` is empty).
 `mock`) · `resolver` URL validation · `player`(+`mpv`,`kitty`) · `database` SQLite
 · `cache` · `config` · `models` · `errors`. Modules use `mod.rs` directories.
 
-Static images: the details-page **poster** is the one image we transmit ourselves
-(`player::kitty::transmit_png`, id `POSTER_ID`) — video is still all mpv. Like the
-video rect, `ui::render` only *reserves* the poster column (`ui::poster_rect` must
-match `render_details`); the `Runner` run loop transmits/removes it after the draw
-(`render_poster`). Fetch/decode/cache runs off-thread (`Runner::fetch_poster` →
-`Msg::Poster`, cached under `Config::cache_dir()/posters`). Player controls route
+Static images (Kitty graphics, transmitted by us — video is still all mpv). Two
+systems, both transmitted from the `Runner` run loop AFTER the draw so ratatui
+doesn't overpaint them, both fed by a shared `reqwest::Client` and disk cache under
+`Config::cache_dir()/posters`:
+- **Details poster** (`transmit_png`, id `POSTER_ID`): high-res `extraLarge`, resized
+  to the reserved box with Lanczos3. `ui::render` only *reserves* the column
+  (`ui::details_poster_rect` must match `render_details`); `Runner::render_poster`
+  paints it; `Runner::fetch_poster` → `Msg::Poster` off-thread.
+- **Browse row thumbnails** (`transmit_png_id`, ids `THUMB_ID_BASE + slot`): a small
+  low-res cover per visible list row. `render_list` reserves `THUMB_COLS`/`ROW_H` and
+  renders at `App.list_offset` (kept by `Runner::update_list_offset` via `keep_in_view`
+  so placement matches). `Runner::place_thumbnails` diffs/debounces and transmits;
+  `fetch_thumb` → `Msg::Thumb` (bounded concurrency, in-memory `thumb_cache`).
+Player controls route
 through `Runner::player_command`, which works for BOTH backends (embedded handle or
 the external window's IPC socket) — `i` skips the opening (`config.skip_intro_secs`).
 

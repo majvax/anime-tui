@@ -106,7 +106,11 @@ pub fn parse_anime_details(json: &str) -> Result<AnimeDetails> {
         id: AnimeId(anime["id"].to_string()),
         title,
         description: anime["description"].as_str().map(str::to_string),
-        poster_url: anime["coverImage"]["large"].as_str().map(str::to_string),
+        // Prefer the highest-res cover (AniList-shaped data); fall back to `large`.
+        poster_url: anime["coverImage"]["extraLarge"]
+            .as_str()
+            .or_else(|| anime["coverImage"]["large"].as_str())
+            .map(str::to_string),
         genres: anime["genres"]
             .as_array()
             .map(|g| {
@@ -201,6 +205,13 @@ mod tests {
         assert_eq!(details.episodes[0].id.0, "95409");
         assert_eq!(details.episodes[0].number, "1");
         assert_eq!(details.episodes[0].title.as_deref(), Some("Episode 1"));
+    }
+
+    #[test]
+    fn parse_anime_details_prefers_extra_large_cover() {
+        let json = r#"{"anime":{"id":1,"title":{"userPreferred":"T"},"coverImage":{"large":"https://img/large.jpg","extraLarge":"https://img/xl.jpg"},"episodesList":[]}}"#;
+        let details = parse_anime_details(json).unwrap();
+        assert_eq!(details.poster_url.as_deref(), Some("https://img/xl.jpg"));
     }
 
     #[test]
