@@ -108,9 +108,10 @@ pub fn build_args(
     args.push(format!("--demuxer-readahead-secs={}", tuning.readahead_secs));
     args.push(format!("--cache-secs={}", tuning.readahead_secs));
 
-    // Start playing as soon as any data is available instead of waiting to fill
-    // the cache — reduces time-to-first-frame on network streams (both backends).
-    args.push("--cache-pause=no".into());
+    // Buffer network streams and let mpv pause briefly to refill when the cache
+    // runs dry, rather than playing through an empty buffer (which stutters on
+    // slower CDNs like sibnet). `--cache=yes` forces the cache on for all inputs.
+    args.push("--cache=yes".into());
 
     match presentation {
         Presentation::External { input_conf } => {
