@@ -1,0 +1,15 @@
+pkgbase = anime-tui
+	pkgdesc = Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/majvax/anime-tui
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	depends = mpv
+	depends = yt-dlp
+	optdepends = ffmpeg: generate the playback proof-of-concept test clip
+	source = anime-tui-0.1.0.tar.gz::https://github.com/majvax/anime-tui/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = anime-tui

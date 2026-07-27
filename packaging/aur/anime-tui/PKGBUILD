@@ -1,0 +1,40 @@
+# Maintainer: majvax <majvax.contact@gmail.com>
+pkgname=anime-tui
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv"
+arch=('x86_64')
+url="https://github.com/majvax/anime-tui"
+license=('MIT')
+depends=('mpv' 'yt-dlp')
+optdepends=('ffmpeg: generate the playback proof-of-concept test clip')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    # Fetch dependencies up front (offline, reproducible build afterwards).
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --bin anime-tui
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/anime-tui" "$pkgdir/usr/bin/anime-tui"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

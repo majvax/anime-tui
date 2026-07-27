@@ -1,0 +1,22 @@
+# Maintainer: majvax <majvax.contact@gmail.com>
+pkgname=anime-tui-bin
+_pkgname=anime-tui
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv (prebuilt static binary)"
+arch=('x86_64')
+url="https://github.com/majvax/anime-tui"
+license=('MIT')
+depends=('mpv' 'yt-dlp')
+provides=('anime-tui')
+conflicts=('anime-tui')
+# Static musl binary from the GitHub Release for this tag.
+source=("$_pkgname-$pkgver-x86_64-unknown-linux-musl.tar.gz::$url/releases/download/v$pkgver/anime-tui-x86_64-unknown-linux-musl.tar.gz")
+# Replace with the release artifact's SHA-256 (see packaging/update-aur.sh).
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "anime-tui" "$pkgdir/usr/bin/anime-tui"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+}

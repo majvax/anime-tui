@@ -35,6 +35,31 @@ cargo test             # unit tests (parsers, URL validation, state, persistence
 
 ## Install
 
+Runtime dependencies for all methods: **`mpv`** and **`yt-dlp`** on `PATH`
+(`sudo pacman -S mpv yt-dlp`).
+
+### Arch Linux (AUR)
+
+```bash
+yay -S anime-tui-bin     # prebuilt static binary — no compile
+yay -S anime-tui         # build from source
+```
+
+`anime-tui-bin` and `anime-tui` both provide the `anime-tui` binary; pick one.
+
+### Prebuilt binary (any x86_64 Linux)
+
+Download the static `x86_64-unknown-linux-musl` tarball from the
+[Releases](https://github.com/majvax/anime-tui/releases) page, verify, and drop it
+on your `PATH`:
+
+```bash
+tar xzf anime-tui-x86_64-unknown-linux-musl.tar.gz
+install -Dm755 anime-tui ~/.local/bin/anime-tui
+```
+
+### From source with Cargo
+
 Install the `anime-tui` binary into your Cargo bin directory (`~/.cargo/bin`,
 which should be on your `PATH`):
 
@@ -51,6 +76,8 @@ anime-tui
 To update after pulling changes, re-run the same `cargo install` command (add
 `--force` if Cargo says the binary is already installed). To uninstall:
 `cargo uninstall anime-tui` (the package name), which removes `anime-tui`.
+
+> Maintainers: see `docs/RELEASING.md` for how tags become Releases and AUR updates.
 
 > Config, history and cache live in the platform dirs for `anime-tui`
 > (e.g. `~/.config/anime-tui/config.toml` on Linux) — the running app prints the

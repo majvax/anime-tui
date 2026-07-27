@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upload-binary:
+    name: Build static binary and publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Builds `anime-tui` for the musl target (fully static: rusqlite is bundled
+      # and reqwest uses rustls, so no system libs), strips it, tars it as
+      # `anime-tui-x86_64-unknown-linux-musl.tar.gz`, writes a .sha256 sidecar, and
+      # creates/updates the GitHub Release for this tag with the artifacts attached.
+      - name: Build & upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: anime-tui
+          target: x86_64-unknown-linux-musl
+          archive: anime-tui-$target
+          checksum: sha256
+          include: LICENSE,README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Respect the committed Cargo.lock for reproducible builds.
+          CARGO_BUILD_LOCKED: "true"
