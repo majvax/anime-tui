@@ -131,6 +131,8 @@ pub enum Effect {
     LoadFavourites,
     LoadHistory,
     Play(AnimeId, EpisodeId),
+    /// Play but always show the source picker (Enter plays the default directly).
+    PlayChoose(AnimeId, EpisodeId),
     /// User confirmed a source from the source-selection list (index into runner's pending list).
     SelectSource(usize),
     /// Toggle favourite for the current anime.
@@ -302,6 +304,8 @@ impl App {
             // Server-side sort applies only to catalogue queries (Home/Search); it
             // re-runs the search from page 1 with the new ordering.
             Action::CycleSort if matches!(self.view, View::Home | View::Search) => self.cycle_sort(),
+            // Open the source picker for the selected episode (Enter plays default).
+            Action::ChooseSource => self.choose_source(),
             // Client-side quick-filter is available in any browse list.
             Action::Filter if self.is_browse_view() => {
                 self.filtering = true;
@@ -372,6 +376,32 @@ impl App {
                 _ => Effect::None,
             },
             View::Player => Effect::None,
+        }
+    }
+
+    /// Resolve the selected episode's sources and open the picker (rather than
+    /// playing the default directly). No-op outside the Episodes view or on a
+    /// season header.
+    fn choose_source(&mut self) -> Effect {
+        if self.view != View::Episodes {
+            return Effect::None;
+        }
+        let rows = self.episode_rows();
+        let Some(EpisodeRow::Episode { index, .. }) = self
+            .episodes_state
+            .selected()
+            .and_then(|i| rows.get(i))
+            .copied()
+        else {
+            return Effect::None;
+        };
+        match self.details.as_ref() {
+            Some(d) if index < d.episodes.len() => {
+                let effect = Effect::PlayChoose(d.id.clone(), d.episodes[index].id.clone());
+                self.loading = true;
+                effect
+            }
+            _ => Effect::None,
         }
     }
 

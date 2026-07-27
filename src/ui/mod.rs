@@ -88,7 +88,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " j/k move · Enter select · F filter · Tab tab · Esc back · q quit"
             }
             View::Details => " Enter episodes · f toggle favourite · Esc back · q quit",
-            View::Episodes => " Enter play / fold season · j/k move · Esc back · q quit",
+            View::Episodes => " Enter play / fold · c choose source · j/k move · Esc back · q quit",
             View::Sources => " Enter select source · j/k move · Esc back",
             View::Player => " Space pause · ,/. ±5s · h/l ±10s · i skip intro · g seek · o window · f fullscreen · n/p ep · q stop",
         };

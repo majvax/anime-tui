@@ -23,6 +23,9 @@ pub enum Action {
     CycleSort,
     /// Enter the client-side quick-filter capture (browse views).
     Filter,
+    /// Open the source picker for the selected episode (Episodes view). Plain Enter
+    /// plays the default source directly; this key lets you choose another.
+    ChooseSource,
     // Playback
     PlayPause,
     SeekForward,
@@ -57,6 +60,7 @@ pub fn default_binding(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         Char('f') => Action::ToggleFavourite,
         Char('S') => Action::CycleSort,
         Char('F') => Action::Filter,
+        Char('c') => Action::ChooseSource,
         Char(' ') => Action::PlayPause,
         Char('m') => Action::Mute,
         Char('n') => Action::NextEpisode,
@@ -82,6 +86,7 @@ mod tests {
     fn sort_and_filter_bindings() {
         assert_eq!(default_binding(KeyCode::Char('S'), KeyModifiers::NONE), Some(Action::CycleSort));
         assert_eq!(default_binding(KeyCode::Char('F'), KeyModifiers::NONE), Some(Action::Filter));
+        assert_eq!(default_binding(KeyCode::Char('c'), KeyModifiers::NONE), Some(Action::ChooseSource));
     }
 
     #[test]

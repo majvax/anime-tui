@@ -107,9 +107,12 @@ can exercise search → details → episodes → playback. `/` to search, `j/k` 
 move, `Enter` to drill in, `q` to quit. The results list **paginates as you
 scroll** (the header shows `shown/total · sort`); `S` cycles the sort order
 (re-queried from the server) and `F` opens a **quick-filter** that narrows the
-loaded results locally (`Enter` keeps it, `Esc` clears). Selecting an episode
-launches mpv in a standalone window by default; set `embedded_player = true` for
-in-terminal (Kitty) playback.
+loaded results locally (`Enter` keeps it, `Esc` clears). `Enter` on an episode
+plays the **default source** directly (`default_source`, e.g. `vidmoly (VF)`) —
+skipping the picker — and if that host fails it **falls back** to the next
+available source automatically; press `c` to open the picker and choose a source
+yourself. Playback launches mpv in a standalone window by default; set
+`embedded_player = true` for in-terminal (Kitty) playback.
 
 On a Kitty-graphics terminal (Kitty/Ghostty/WezTerm) the details page shows the
 anime's **cover art** (fetched once and cached under the cache dir). During

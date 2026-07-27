@@ -33,3 +33,9 @@ readahead_secs = 10
 
 # Seconds the `i` key jumps forward to skip an opening (typical anime OP ≈ 90 s).
 skip_intro_secs = 85
+
+# Preferred source for direct play (Enter skips the picker and plays this). Matched
+# against source labels like "vidmoly (VF)" by host + language, case-insensitively;
+# if it isn't available for an episode, the most reliable source is used. Press `c`
+# to open the picker and choose a different source.
+default_source = "vidmoly (VF)"

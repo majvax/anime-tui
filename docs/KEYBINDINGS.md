@@ -12,7 +12,8 @@ from `[keys]` in config.toml in a later phase.
 | `k` / `↑`      | Move up           |
 | `h` / `←`      | Move left / back  |
 | `l` / `→`      | Move right / into |
-| `Enter`        | Select / drill in |
+| `Enter`        | Select / drill in / play (default source) |
+| `c`            | Choose source (open the picker) instead of the default |
 | `Esc`          | Back              |
 | `/`            | Search            |
 | `Tab`          | Switch tab (Home / Favourites / History) |

@@ -52,6 +52,9 @@ enum Msg {
         anime: AnimeId,
         episode: EpisodeId,
         result: Result<Vec<PreparedSource>>,
+        /// True when the user asked to pick a source (show the picker); false plays
+        /// the configured default source directly.
+        choose: bool,
     },
     /// External-backend playback finished (embedded finish is detected via tick).
     ExternalEnded {
@@ -126,6 +129,8 @@ pub struct Runner {
 
     /// Seconds the `i` key jumps to skip an opening.
     skip_intro_secs: u64,
+    /// Preferred source label for direct (Enter) playback, e.g. "vidmoly (VF)".
+    default_source: String,
     /// On-disk cache of raw poster source bytes.
     poster_cache: crate::cache::Cache,
     /// The current poster's decoded image, resized to the display box at transmit.
@@ -220,6 +225,7 @@ impl Runner {
             prefetch_target: None,
             prefetch_queue: std::collections::VecDeque::new(),
             skip_intro_secs: config.playback.skip_intro_secs,
+            default_source: config.playback.default_source.clone(),
             poster_cache,
             current_poster: None,
             poster_dirty: false,
@@ -828,22 +834,8 @@ impl Runner {
                     }
                 }
             }
-            Effect::Play(anime, episode) => {
-                // Fast path: the episode was prefetched while hovering — play now.
-                if let Some(sources) = self.source_cache.get(&episode.0).cloned() {
-                    let _ = self.tx.send(Msg::Resolved {
-                        anime,
-                        episode,
-                        result: Ok(sources),
-                    });
-                    return;
-                }
-                let (provider, tx) = (self.provider.clone(), self.tx.clone());
-                tokio::spawn(async move {
-                    let result = resolve_and_prepare(&*provider, &anime, &episode).await;
-                    let _ = tx.send(Msg::Resolved { anime, episode, result });
-                });
-            }
+            Effect::Play(anime, episode) => self.dispatch_resolve(anime, episode, false),
+            Effect::PlayChoose(anime, episode) => self.dispatch_resolve(anime, episode, true),
             Effect::SelectSource(i) => {
                 // Use the (anime, episode) pair captured when the sources were
                 // resolved. Do NOT recompute from `episodes_state.selected()`:
@@ -877,6 +869,22 @@ impl Runner {
                 self.app.is_favourite = new_state;
             }
         }
+    }
+
+    /// Resolve an episode's sources (prefetched cache first, else via yt-dlp) and
+    /// report them back as `Msg::Resolved`. `choose` requests the source picker;
+    /// otherwise the configured default source is played directly.
+    fn dispatch_resolve(&mut self, anime: AnimeId, episode: EpisodeId, choose: bool) {
+        // Fast path: the episode was prefetched while hovering — play now.
+        if let Some(sources) = self.source_cache.get(&episode.0).cloned() {
+            let _ = self.tx.send(Msg::Resolved { anime, episode, result: Ok(sources), choose });
+            return;
+        }
+        let (provider, tx) = (self.provider.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let result = resolve_and_prepare(&*provider, &anime, &episode).await;
+            let _ = tx.send(Msg::Resolved { anime, episode, result, choose });
+        });
     }
 
     async fn on_message(&mut self, msg: Msg) {
@@ -941,29 +949,39 @@ impl Runner {
                 self.app.set_results(hist);
             }
             Msg::History(Err(e)) => self.fail(e),
-            Msg::Resolved { anime, episode, result } => match result {
+            Msg::Resolved { anime, episode, result, choose } => match result {
                 Ok(sources) if sources.is_empty() => {
                     self.fail(Error::Resolve("no sources returned".into()));
                     if self.app.view == View::Player {
                         self.app.view = View::Episodes;
                     }
                 }
+                // Explicit "choose source" with more than one option → show the picker.
+                Ok(sources) if choose && sources.len() > 1 => {
+                    let labels: Vec<String> = sources
+                        .iter()
+                        .map(|s| s.label.clone().unwrap_or_else(|| s.url.clone()))
+                        .collect();
+                    self.pending_sources = sources;
+                    // Store the intended (anime, episode) pair so SelectSource can use it.
+                    self.playing = Some((anime, episode));
+                    self.app.loading = false;
+                    self.app.set_sources(labels);
+                }
+                // Default: play the preferred source directly, falling back through the
+                // rest (reliability order) if it fails to start.
                 Ok(sources) => {
-                    if sources.len() == 1 {
-                        self.pending_sources = sources.clone();
-                        self.start_playback_queue(anime, episode, sources).await;
-                    } else {
-                        // Multiple sources: show selection list; runner retains all of them.
-                        let labels: Vec<String> = sources
-                            .iter()
-                            .map(|s| s.label.clone().unwrap_or_else(|| s.url.clone()))
-                            .collect();
-                        self.pending_sources = sources;
-                        // Store the intended (anime, episode) pair so SelectSource can use it.
-                        self.playing = Some((anime, episode));
-                        self.app.loading = false;
-                        self.app.set_sources(labels);
+                    self.pending_sources = sources.clone();
+                    let start = pick_default_index(&sources, &self.default_source);
+                    let mut queue = Vec::with_capacity(sources.len());
+                    queue.push(sources[start].clone());
+                    for (j, s) in sources.into_iter().enumerate() {
+                        if j != start {
+                            queue.push(s);
+                        }
                     }
+                    self.app.view = View::Player;
+                    self.start_playback_queue(anime, episode, queue).await;
                 }
                 Err(e) => {
                     self.fail(e);
@@ -1623,6 +1641,27 @@ async fn resolve_sources(
     Ok(prepared)
 }
 
+/// Index of the source best matching the `preferred` label (e.g. "vidmoly (VF)"),
+/// or `0` when none matches. Matching is by tokens (host + language) contained in
+/// the source label, case-insensitively. `sources` is already reliability-ordered,
+/// so index 0 is the sensible fallback.
+fn pick_default_index(sources: &[PreparedSource], preferred: &str) -> usize {
+    let tokens: Vec<String> = preferred
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if !tokens.is_empty() {
+        if let Some(i) = sources.iter().position(|s| {
+            let label = s.label.as_deref().unwrap_or("").to_lowercase();
+            tokens.iter().all(|t| label.contains(t.as_str()))
+        }) {
+            return i;
+        }
+    }
+    0
+}
+
 /// Reliability rank for a source host (lower = try first). yt-dlp resolves
 /// vidmoly (generic) and sibnet (dedicated extractor); voe has no working
 /// extractor today, so it sorts last and is only reached via fallback.
@@ -1752,7 +1791,22 @@ fn referer_of(headers: &[(String, String)]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_rank, keep_in_view, parse_ytdl_headers, referer_of};
+    use super::{host_rank, keep_in_view, parse_ytdl_headers, pick_default_index, referer_of, PreparedSource};
+
+    fn src(label: &str) -> PreparedSource {
+        PreparedSource { url: "https://x/v".into(), headers: vec![], label: Some(label.into()) }
+    }
+
+    #[test]
+    fn pick_default_matches_host_and_language() {
+        let sources = vec![src("vidmoly (VOSTFR)"), src("sibnet (VF)"), src("vidmoly (VF)")];
+        // Host + language both must match.
+        assert_eq!(pick_default_index(&sources, "vidmoly (VF)"), 2);
+        assert_eq!(pick_default_index(&sources, "sibnet (VF)"), 1);
+        // No match → 0 (list is already reliability-ordered).
+        assert_eq!(pick_default_index(&sources, "voe (VF)"), 0);
+        assert_eq!(pick_default_index(&sources, ""), 0);
+    }
 
     #[test]
     fn host_rank_orders_working_hosts_first_voe_last() {

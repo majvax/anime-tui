@@ -45,6 +45,10 @@ pub struct Playback {
     pub readahead_secs: u64,
     /// How many seconds the `i` key jumps to skip an opening. Typical anime OP ≈ 90 s.
     pub skip_intro_secs: u64,
+    /// Preferred source when playing directly (Enter) without the picker. Matched
+    /// against source labels like "vidmoly (VF)" by tokens (host + language), case-
+    /// insensitively; if none matches, the most reliable available source is used.
+    pub default_source: String,
 }
 
 impl Default for Config {
@@ -77,6 +81,7 @@ impl Default for Playback {
             max_buffer_mib: 64,
             readahead_secs: 10,
             skip_intro_secs: 85,
+            default_source: "vidmoly (VF)".into(),
         }
     }
 }
