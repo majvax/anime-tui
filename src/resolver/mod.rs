@@ -105,30 +105,43 @@ fn b64(bytes: &[u8]) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Decode VOE's obfuscated JSON blob. The documented transform (reverse order of the
-/// site's encoder): ROT13 → strip `_` → base64 → shift each byte by −3 → reverse →
-/// base64 → UTF-8 JSON. Returns the decoded JSON string.
+/// Junk digraphs VOE interleaves into its obfuscated payload (stripped before the
+/// base64 stages). Confirmed against a live embed page, 2026-07.
+const VOE_JUNK: [&str; 7] = ["@$", "^^", "~@", "%?", "*~", "!!", "#&"];
+
+/// Decode VOE's obfuscated payload string (element 0 of the `application/json`
+/// array): ROT13 → strip the junk digraphs → base64 → shift each byte by −3 →
+/// reverse → base64 → UTF-8 JSON. Returns the decoded JSON string.
 ///
 /// NOTE: VOE rotates its obfuscation periodically; if this stops matching, capture a
-/// fresh embed page (ANIME_TUI_DUMP) and adjust here.
-pub fn voe_decode(blob: &str) -> Option<String> {
-    let a = rot13(blob.trim().as_bytes());
-    let b: Vec<u8> = a.into_iter().filter(|&c| c != b'_').collect();
-    let c = b64(&b)?;
+/// fresh embed page (ANIME_TUI_DUMP / `cargo run --example dump_voe`) and adjust.
+pub fn voe_decode(payload: &str) -> Option<String> {
+    let mut s = String::from_utf8(rot13(payload.trim().as_bytes())).ok()?;
+    for junk in VOE_JUNK {
+        s = s.replace(junk, "");
+    }
+    let c = b64(s.as_bytes())?;
     let d: Vec<u8> = c.iter().map(|&x| x.wrapping_sub(3)).collect();
     let e: Vec<u8> = d.into_iter().rev().collect();
     let f = b64(&e)?;
     String::from_utf8(f).ok()
 }
 
-/// Extract the playable stream URL from a VOE embed page: pull the obfuscated blob
-/// from the `<script type="application/json">…</script>` tag, [`voe_decode`] it, and
-/// find the media URL (hls `source`/`direct_access_url`) inside. The caller adds the
-/// VOE `Referer`.
+/// Extract the playable stream URL from a VOE embed page: read the obfuscated payload
+/// from `<script type="application/json">["…"]</script>`, [`voe_decode`] it, and take
+/// the `source` (HLS) — or `direct_access_url` (progressive mp4) — from the decoded
+/// JSON. The caller adds the `Referer`.
 pub fn voe_stream_url(html: &str) -> Option<String> {
-    let blob = extract_json_script(html)?;
-    let json = voe_decode(&blob)?;
-    find_media_url(&json)
+    let raw = extract_json_script(html)?;
+    // The script body is a JSON array whose first element is the obfuscated payload.
+    let arr: Vec<String> = serde_json::from_str(raw.trim()).ok()?;
+    let payload = arr.into_iter().next()?;
+    let json = voe_decode(&payload)?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v.get("source")
+        .or_else(|| v.get("direct_access_url"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
 }
 
 /// The text of the first `<script type="application/json">…</script>` block.
@@ -157,31 +170,39 @@ mod tests {
         assert!(find_media_url("no media here").is_none());
     }
 
-    #[test]
-    fn voe_decode_roundtrips_documented_transform() {
-        // Encode with the inverse transform, then assert voe_decode recovers it.
-        let json = r#"{"source":"https://delivery.voe/hls/master.m3u8"}"#;
-        let e = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
-        let d: Vec<u8> = e.bytes().rev().collect();
-        let c: Vec<u8> = d.iter().map(|&x| x.wrapping_add(3)).collect();
-        let b = base64::engine::general_purpose::STANDARD.encode(&c);
-        let blob = String::from_utf8(rot13(b.as_bytes())).unwrap();
-        assert_eq!(voe_decode(&blob).as_deref(), Some(json));
+    /// Build a VOE-obfuscated payload from a JSON string (inverse of `voe_decode`),
+    /// mirroring the real algorithm confirmed against a live page.
+    fn voe_encode(json: &str) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let e = b64.encode(json.as_bytes()); // decode step 6: base64
+        let rev: Vec<u8> = e.into_bytes().into_iter().rev().collect(); // step 5: reverse
+        let plus3: Vec<u8> = rev.iter().map(|&x| x.wrapping_add(3)).collect(); // step 4: -3
+        let b = b64.encode(&plus3); // step 3: base64
+        String::from_utf8(rot13(b.as_bytes())).unwrap() // step 2: rot13 (self-inverse)
     }
 
     #[test]
-    fn voe_stream_url_from_embedded_json() {
-        let json = r#"{"source":"https://delivery.voe/hls/master.m3u8"}"#;
-        let e = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
-        let d: Vec<u8> = e.bytes().rev().collect();
-        let c: Vec<u8> = d.iter().map(|&x| x.wrapping_add(3)).collect();
-        let b = base64::engine::general_purpose::STANDARD.encode(&c);
-        let blob = String::from_utf8(rot13(b.as_bytes())).unwrap();
-        let html = format!(r#"<script type="application/json"> {blob} </script>"#);
+    fn voe_decode_roundtrips_real_transform() {
+        let json = r#"{"source":"https://delivery.voe/hls/master.m3u8?t=abc"}"#;
+        // Junk digraphs are stripped by the decoder, so sprinkling them in is a no-op.
+        let mut payload = voe_encode(json);
+        payload.insert_str(4, "@$");
+        payload.push_str("#&");
+        assert_eq!(voe_decode(&payload).as_deref(), Some(json));
+    }
+
+    #[test]
+    fn voe_stream_url_prefers_source_then_direct() {
+        let json = r#"{"source":"https://cdn.voe/hls/master.m3u8?t=x","direct_access_url":"https://cdn.voe/f.mp4"}"#;
+        let html = format!(r#"<script type="application/json">["{}"]</script>"#, voe_encode(json));
         assert_eq!(
             voe_stream_url(&html).as_deref(),
-            Some("https://delivery.voe/hls/master.m3u8"),
+            Some("https://cdn.voe/hls/master.m3u8?t=x"),
         );
+        // Falls back to the progressive mp4 when there's no HLS source.
+        let json2 = r#"{"direct_access_url":"https://cdn.voe/f.mp4?t=y"}"#;
+        let html2 = format!(r#"<script type="application/json">["{}"]</script>"#, voe_encode(json2));
+        assert_eq!(voe_stream_url(&html2).as_deref(), Some("https://cdn.voe/f.mp4?t=y"));
     }
 
     #[test]

@@ -1718,14 +1718,13 @@ async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) ->
             }
         }
     } else if host_is("voe") {
-        // VOE sometimes serves a thin redirect page first; follow one media hop.
+        // VOE is served from rotating mirror domains; the CDN token is IP+time
+        // locked, and the correct Referer is the embed page's own origin.
+        let origin = origin_of(&s.url).unwrap_or_else(|| "https://voe.sx/".into());
         if let Some(html) = fetch_embed(client, &s.url).await {
-            let direct = crate::resolver::voe_stream_url(&html).or_else(|| {
-                crate::resolver::find_media_url(&html)
-            });
-            if let Some(direct) = direct {
+            if let Some(direct) = crate::resolver::voe_stream_url(&html) {
                 s.url = direct;
-                s.headers = referer("https://voe.sx/");
+                s.headers = referer(&origin);
             }
         }
     }
@@ -1747,6 +1746,12 @@ async fn fetch_embed(client: &reqwest::Client, url: &str) -> Option<String> {
 
 fn referer(value: &str) -> Vec<(String, String)> {
     vec![("Referer".to_string(), value.to_string())]
+}
+
+/// `scheme://host/` of a URL, e.g. for use as a Referer.
+fn origin_of(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    Some(format!("{}://{}/", u.scheme(), u.host_str()?))
 }
 
 #[cfg(test)]
