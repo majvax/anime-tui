@@ -1772,13 +1772,32 @@ async fn resolve_and_prepare(
     .await;
     for (s, (u, headers)) in sources.iter_mut().zip(resolved) {
         s.url = u;
-        // Prefer yt-dlp's per-stream headers (correct Referer/UA for the CDN); keep
-        // the site referer only when resolution didn't yield any (page fallback).
+        // Overlay yt-dlp's access-control headers (correct Referer/UA for the CDN)
+        // onto the site headers, keeping the site referer when yt-dlp gives none.
         if let Some(h) = headers {
-            s.headers = h;
+            merge_stream_headers(&mut s.headers, h);
         }
     }
     Ok(sources)
+}
+
+/// Overlay yt-dlp's stream headers onto `base`, keeping ONLY the access-control
+/// headers that are safe for mpv's comma-separated `--http-header-fields`. yt-dlp's
+/// full header set includes `Accept`/`Accept-Language` whose values contain commas —
+/// forwarding those corrupts the whole header list (mpv splits on `,`) and breaks
+/// every request, so we allowlist and drop any comma-containing value.
+fn merge_stream_headers(base: &mut Vec<(String, String)>, extra: Vec<(String, String)>) {
+    const ALLOW: [&str; 3] = ["referer", "user-agent", "origin"];
+    for (k, v) in extra {
+        if v.contains(',') || !ALLOW.contains(&k.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        if let Some(slot) = base.iter_mut().find(|(bk, _)| bk.eq_ignore_ascii_case(&k)) {
+            slot.1 = v;
+        } else {
+            base.push((k, v));
+        }
+    }
 }
 
 /// The `Referer` value from a header list, if present (case-insensitive key).
@@ -1829,6 +1848,35 @@ mod tests {
         // Empty / non-object → None (fall back to keeping existing headers).
         assert!(parse_ytdl_headers("{}").is_none());
         assert!(parse_ytdl_headers("not json").is_none());
+    }
+
+    #[test]
+    fn merge_stream_headers_allowlists_and_drops_commas() {
+        use super::merge_stream_headers;
+        let mut base = vec![("Referer".to_string(), "https://nakanime.tv/".to_string())];
+        merge_stream_headers(
+            &mut base,
+            vec![
+                ("Referer".into(), "https://video.sibnet.ru/".into()), // overrides
+                ("User-Agent".into(), "Mozilla/5.0".into()),           // added
+                ("Accept".into(), "text/html,application/xml".into()), // dropped (comma)
+                ("Sec-Fetch-Mode".into(), "navigate".into()),          // dropped (not allowed)
+            ],
+        );
+        // Referer overridden to the CDN host, UA added, comma/other headers dropped.
+        assert!(base.iter().any(|(k, v)| k == "Referer" && v == "https://video.sibnet.ru/"));
+        assert!(base.iter().any(|(k, v)| k == "User-Agent" && v == "Mozilla/5.0"));
+        assert!(!base.iter().any(|(k, _)| k == "Accept"));
+        assert!(!base.iter().any(|(k, _)| k == "Sec-Fetch-Mode"));
+    }
+
+    #[test]
+    fn merge_stream_headers_keeps_site_referer_when_none_given() {
+        use super::merge_stream_headers;
+        let mut base = vec![("Referer".to_string(), "https://nakanime.tv/".to_string())];
+        merge_stream_headers(&mut base, vec![("User-Agent".into(), "UA".into())]);
+        assert!(base.iter().any(|(k, v)| k == "Referer" && v == "https://nakanime.tv/"));
+        assert!(base.iter().any(|(k, v)| k == "User-Agent" && v == "UA"));
     }
 
     #[test]

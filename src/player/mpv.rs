@@ -163,8 +163,13 @@ pub fn build_args(
         }
     }
 
-    if !headers.is_empty() {
-        let joined = headers
+    // `--http-header-fields` is a COMMA-separated list with no escaping, so any
+    // header whose value contains a comma (e.g. an `Accept`/`Accept-Language`
+    // captured from yt-dlp) would corrupt the whole list and break every request.
+    // Drop those defensively — callers should already allowlist safe headers.
+    let safe: Vec<&(String, String)> = headers.iter().filter(|(_, v)| !v.contains(',')).collect();
+    if !safe.is_empty() {
+        let joined = safe
             .iter()
             .map(|(k, v)| format!("{k}: {v}"))
             .collect::<Vec<_>>()
@@ -299,6 +304,25 @@ mod tests {
             &MpvTuning::default(),
         );
         assert!(a.iter().any(|s| s == "--http-header-fields=Referer: https://ref"));
+    }
+
+    #[test]
+    fn comma_valued_headers_are_dropped() {
+        // A comma in a value would corrupt the comma-separated field list.
+        let h = vec![
+            ("Referer".into(), "https://ref".into()),
+            ("Accept".into(), "text/html,application/xml".into()),
+        ];
+        let a = build_args(
+            "https://x/v",
+            "/tmp/s",
+            &Presentation::External { input_conf: None },
+            &h,
+            &MpvTuning::default(),
+        );
+        // Only the comma-free header survives, and it's the whole field value.
+        assert!(a.iter().any(|s| s == "--http-header-fields=Referer: https://ref"));
+        assert!(!a.iter().any(|s| s.contains("Accept")));
     }
 
     #[test]
