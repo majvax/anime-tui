@@ -48,7 +48,7 @@ protocol, so embedded playback works, but there is **no `kitty`/`kitten`
 binary** — do not depend on `kitten icat`. Capability detection keys off
 `KITTY_WINDOW_ID` / `TERM` / `TERM_PROGRAM` (`player::kitty::probe_support`).
 
-## The POC (`src/bin/poc_kitty.rs`)
+## The POC (`examples/poc_kitty.rs`)
 
 Reserves a rectangle, spawns `mpv --vo=kitty` into it with IPC, toggles pause
 over the socket, respawns aligned on resize, and on every exit path kills mpv +
@@ -58,7 +58,7 @@ emits `_Ga=d,d=A` (delete all placements) + restores the terminal.
 
 ```
 scripts/gen_test_media.sh                 # writes /tmp/anime-tui-poc-test.mp4
-cargo run --bin poc_kitty -- /tmp/anime-tui-poc-test.mp4
+cargo run --example poc_kitty -- /tmp/anime-tui-poc-test.mp4
 ```
 
 ### Non-interactive validation performed here

@@ -1,6 +1,6 @@
 [package]
 name = "anime-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv"
@@ -19,11 +19,10 @@ name = "anime-tui"
 path = "src/main.rs"
 
 # Proof-of-concept: validates the mpv --vo=kitty embedded-playback pipeline.
+# A dev-only example so it is never installed by `cargo install` / packaging.
 # Run inside a Kitty-graphics-capable terminal (Kitty, Ghostty, WezTerm):
-#   cargo run --bin poc_kitty -- /path/to/local.mp4
-[[bin]]
-name = "poc_kitty"
-path = "src/bin/poc_kitty.rs"
+#   cargo run --example poc_kitty -- /path/to/local.mp4
+# (auto-discovered from examples/poc_kitty.rs — no explicit target needed)
 
 [dependencies]
 # TUI

@@ -1,7 +1,7 @@
 # Maintainer: majvax <majvax.contact@gmail.com>
 pkgname=anime-tui-bin
 _pkgname=anime-tui
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv (prebuilt static binary)"
 arch=('x86_64')

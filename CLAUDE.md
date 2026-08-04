@@ -23,7 +23,7 @@ cargo test                           # all unit tests
 cargo test <name>                    # single test, e.g. `cargo test progress_roundtrip`
 cargo test -p anime-tui player::  # tests under one module path
 cargo run --bin anime-tui            # app skeleton: prints backend + config path
-cargo run --bin poc_kitty -- FILE    # playback proof-of-concept (needs a Kitty-graphics terminal)
+cargo run --example poc_kitty -- FILE    # playback proof-of-concept (needs a Kitty-graphics terminal)
 scripts/gen_test_media.sh            # make /tmp/anime-tui-poc-test.mp4 for the POC
 cargo clippy --all-targets           # lint
 ```
@@ -86,7 +86,7 @@ if a terminal lacks a working mpv kitty VO.
   allowlist) before reaching mpv.
 - **Cleanup on every exit path**: kill mpv → emit `player::kitty::DELETE_ALL_IMAGES`
   → leave alt screen → disable raw mode. Implemented via a `Drop` guard AND a
-  panic hook (see `src/bin/poc_kitty.rs`). Preserve both when refactoring.
+  panic hook (see `examples/poc_kitty.rs`). Preserve both when refactoring.
 - **Secrets discipline**: cookies, referer, user-agent, tokens, resolved stream
   URLs are sensitive. Never `tracing::*` them; never log the arg vector that
   contains `--http-header-fields`.

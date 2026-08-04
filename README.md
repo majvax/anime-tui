@@ -89,7 +89,7 @@ Validates the whole embedded-playback pipeline on a local file (no network):
 
 ```bash
 scripts/gen_test_media.sh                          # -> /tmp/anime-tui-poc-test.mp4
-cargo run --bin poc_kitty -- /tmp/anime-tui-poc-test.mp4
+cargo run --example poc_kitty -- /tmp/anime-tui-poc-test.mp4
 ```
 
 `Space` pauses (over mpv IPC), resizing realigns the video, `q` quits and

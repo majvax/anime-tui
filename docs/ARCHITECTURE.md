@@ -68,7 +68,7 @@ robust than a hand-rolled pipeline, and keeps us off "implement codecs" territor
 
 ## Development phases
 
-1. **Validation** — env probe + local-file Kitty POC (`src/bin/poc_kitty.rs`). ✅ done
+1. **Validation** — env probe + local-file Kitty POC (`examples/poc_kitty.rs`). ✅ done
 2. **Skeleton** — async event loop (`app::run`), typed events/effects, config, DB,
    mock provider, external-mpv playback, live TUI views. ✅ done
 3. **Provider** — Nakanime transport confirmed & wired (endpoints, cookies,
