@@ -4,6 +4,7 @@
 
 use std::io::{Stdout, Write};
 
+use crossterm::event::EnableFocusChange;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -26,7 +27,11 @@ impl TerminalGuard {
         install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+        // EnableFocusChange: Ghostty repaints from its image cache on focus
+        // loss/gain (workspace switch); if mpv keeps transmitting frames during
+        // that repaint, RSS spikes to GBs. We pause mpv on FocusLost / resume on
+        // FocusGained (see Runner::on_terminal_event) to avoid it.
+        execute!(stdout, EnterAlternateScreen, cursor::Hide, EnableFocusChange)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }

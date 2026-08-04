@@ -177,6 +177,10 @@ pub struct Runner {
     /// Path to the generated mpv input.conf that gives the external window our
     /// keybinds (None if it couldn't be written → mpv defaults still apply).
     input_conf_path: Option<String>,
+
+    /// True when we auto-paused embedded playback on terminal focus loss (so we
+    /// only auto-resume what we paused, never a manual pause). See on_terminal_event.
+    focus_paused: bool,
 }
 
 impl Runner {
@@ -253,6 +257,7 @@ impl Runner {
                 readahead_secs: config.playback.readahead_secs,
             },
             input_conf_path,
+            focus_paused: false,
         })
     }
 
@@ -338,6 +343,23 @@ impl Runner {
             Event::Resize(_, _) => {
                 self.poster_dirty = true; // reposition the poster at the new size
                 self.on_resize().await;
+            }
+            // Ghostty repaints its image cache on workspace switch; embedded mpv
+            // frames transmitted during that repaint spike RSS to GBs. Pause mpv
+            // while unfocused, resume on return — but only auto-resume what we
+            // paused, so a manual pause survives a focus round-trip.
+            Event::FocusLost
+                if self.player.is_some()
+                    && !self.app.playback.is_some_and(|p| p.paused) =>
+            {
+                self.player_command(vec![json!("set"), json!("pause"), json!(true)])
+                    .await;
+                self.focus_paused = true;
+            }
+            Event::FocusGained if self.focus_paused => {
+                self.player_command(vec![json!("set"), json!("pause"), json!(false)])
+                    .await;
+                self.focus_paused = false;
             }
             _ => {}
         }
