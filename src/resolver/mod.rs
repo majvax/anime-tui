@@ -143,50 +143,54 @@ pub fn unpack_packed_js(src: &str) -> Option<String> {
         return None;
     }
     let keywords: Vec<&str> = rest[kwo + 1..kwc].split('|').collect();
-    // p.a.c.k.e.r substitutes from the highest index down.
-    let mut out = payload;
-    for c in (0..keywords.len()).rev() {
-        if !keywords[c].is_empty() {
-            out = replace_word(&out, &to_base(c, radix), keywords[c]);
+    // Single pass over the ORIGINAL payload: each base-`radix` word-token is
+    // replaced by its keyword, everything else copied verbatim. This is the correct
+    // p.a.c.k.e.r decode — it must NOT iterate `.replace()` over the growing output
+    // (a keyword can contain a token substring, which re-expands and blows the
+    // string up exponentially: a real vidzy page exploded 7 KB → 7 MB and hung).
+    let bytes = payload.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(payload.len() * 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_word(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            let word = &payload[start..i];
+            match from_base(word, radix) {
+                Some(idx) if idx < keywords.len() && !keywords[idx].is_empty() => {
+                    out.push_str(keywords[idx])
+                }
+                _ => out.push_str(word),
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
         }
     }
     Some(out)
 }
 
-fn to_base(mut n: usize, radix: u32) -> String {
-    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let radix = (radix.clamp(2, 36)) as usize;
-    if n == 0 {
-        return "0".to_string();
-    }
-    let mut buf = Vec::new();
-    while n > 0 {
-        buf.push(DIGITS[n % radix]);
-        n /= radix;
-    }
-    buf.reverse();
-    String::from_utf8(buf).unwrap()
-}
-
-/// Replace whole-word occurrences of `word` (bounded by non-`[A-Za-z0-9_]`) with
-/// `repl`. Payload/keywords are ASCII, so byte scanning is safe.
-fn replace_word(hay: &str, word: &str, repl: &str) -> String {
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let (hb, wb) = (hay.as_bytes(), word.as_bytes());
-    let mut out = String::with_capacity(hay.len());
-    let mut i = 0;
-    while i < hb.len() {
-        let boundary_before = i == 0 || !is_word(hb[i - 1]);
-        let boundary_after = i + wb.len() >= hb.len() || !is_word(hb[i + wb.len()]);
-        if boundary_before && boundary_after && hb[i..].starts_with(wb) {
-            out.push_str(repl);
-            i += wb.len();
-        } else {
-            out.push(hb[i] as char);
-            i += 1;
+/// Parse a lowercase base-`radix` token to its index — case-sensitive, mirroring
+/// JS `c.toString(radix)` (tokens are lowercase; an uppercase word is a real
+/// identifier, not a token). Returns `None` if any char is out of range or the
+/// value overflows `usize` (a long identifier that isn't a token).
+fn from_base(word: &str, radix: u32) -> Option<usize> {
+    let mut n: usize = 0;
+    for c in word.chars() {
+        let d = match c {
+            '0'..='9' => c as u32 - '0' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 10,
+            _ => return None,
+        };
+        if d >= radix {
+            return None;
         }
+        n = n.checked_mul(radix as usize)?.checked_add(d as usize)?;
     }
-    out
+    Some(n)
 }
 
 fn rot13(bytes: &[u8]) -> Vec<u8> {
@@ -245,6 +249,117 @@ pub fn voe_stream_url(html: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The first quoted absolute embed URL (`http(s)://…/e/…`) in the page — the target
+/// of VOE's JS `window.location`/mirror redirect stub. Only meaningful on a stub
+/// (a real page resolves via [`voe_stream_url`] before we look here).
+pub fn voe_mirror_target(html: &str) -> Option<String> {
+    let mut search = html;
+    while let Some(p) = search.find("http") {
+        let tail = &search[p..];
+        let end = tail.find(['\'', '"', ' ', '\\', '\n', '\r', '<', ')']).unwrap_or(tail.len());
+        let cand = &tail[..end];
+        if (cand.starts_with("http://") || cand.starts_with("https://")) && cand.contains("/e/") {
+            return Some(cand.to_string());
+        }
+        search = &tail[4.min(tail.len())..];
+    }
+    None
+}
+
+/// The `<form>` fields of VOE's "Confirm you're human" proof-of-work gate page.
+#[derive(Debug, Clone)]
+pub struct VoeGate {
+    /// Form POST target (also the page's own URL).
+    pub action: String,
+    /// Laravel CSRF `_token`.
+    pub token: String,
+    /// URL that returns the PBKDF2 challenge JSON.
+    pub challenge_url: String,
+}
+
+/// Parse VOE's PoW gate page, or `None` if it isn't one. Presence of `altcha-widget`
+/// marks the gate; we then read the form action, CSRF `_token`, and challenge URL.
+pub fn voe_gate(html: &str) -> Option<VoeGate> {
+    if !html.contains("altcha-widget") {
+        return None;
+    }
+    Some(VoeGate {
+        action: quoted_after(html, "action=\"")?,
+        token: quoted_after(html, "name=\"_token\" value=\"")?,
+        challenge_url: quoted_after(html, "challenge=\"")?,
+    })
+}
+
+/// The string between `marker` and the next `"`.
+fn quoted_after(html: &str, marker: &str) -> Option<String> {
+    let at = html.find(marker)? + marker.len();
+    let rest = &html[at..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Solve VOE's "confirm you're human" PBKDF2 proof-of-work from the challenge JSON,
+/// returning the base64 `altcha` form value to POST back. The PoW: find the smallest
+/// counter where PBKDF2-HMAC-SHA256(`nonce ++ big-endian u32(counter)`, `salt`,
+/// `cost` iterations, `keyLength` bytes) begins with `keyPrefix`. keyPrefix is one
+/// byte ("00"), so ~256 tries typical. Returns `None` on malformed JSON, or if no
+/// solution is found within a safety bound.
+pub fn voe_solve_challenge(challenge_json: &str) -> Option<String> {
+    use ring::pbkdf2;
+    let v: serde_json::Value = serde_json::from_str(challenge_json).ok()?;
+    let p = v.get("parameters")?;
+    let signature = v.get("signature")?;
+    let nonce = hex_to_bytes(p.get("nonce")?.as_str()?)?;
+    let salt = hex_to_bytes(p.get("salt")?.as_str()?)?;
+    let cost = p.get("cost")?.as_u64()? as u32;
+    let key_length = p.get("keyLength").and_then(|x| x.as_u64()).unwrap_or(32) as usize;
+    let prefix = hex_to_bytes(p.get("keyPrefix")?.as_str()?)?;
+    let iters = std::num::NonZeroU32::new(cost)?;
+
+    // password = nonce bytes followed by a big-endian u32 counter (uint32 mode).
+    let mut password = nonce;
+    let base = password.len();
+    password.extend_from_slice(&[0u8; 4]);
+    let mut out = vec![0u8; key_length.max(1)];
+    let mut counter: u32 = 0;
+    let derived_hex = loop {
+        password[base..].copy_from_slice(&counter.to_be_bytes());
+        pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, iters, &salt, &password, &mut out);
+        if out.starts_with(&prefix) {
+            break bytes_to_hex(&out);
+        }
+        // keyPrefix is 1 byte; a solution is overwhelmingly likely well before this.
+        counter = counter.checked_add(1).filter(|c| *c < (1 << 24))?;
+    };
+
+    // The server accepts the "verbose" altcha payload: the echoed challenge plus the
+    // solution. It verifies by value (order/spacing-independent), confirmed live.
+    let payload = serde_json::json!({
+        "challenge": { "parameters": p, "signature": signature },
+        "solution": { "counter": counter, "derivedKey": derived_hex, "time": 100 }
+    });
+    Some(base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&payload).ok()?))
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
+}
+
 /// The text of the first `<script type="application/json">…</script>` block.
 fn extract_json_script(html: &str) -> Option<String> {
     let key = "application/json";
@@ -290,6 +405,16 @@ mod tests {
     }
 
     #[test]
+    fn unpack_is_single_pass_no_cascade() {
+        // keyword[1] = "(0)" contains a bounded copy of token "0". Single-pass decode
+        // emits it verbatim → "(0)". The old iterative decode re-expanded that inner
+        // "0" into keyword[0]="X" → "(X)", and on real pages this cascade blew the
+        // string up exponentially (7 KB → 7 MB) and hung. Guard against regressing.
+        let src = r"eval(function(p,a,c,k,e,d){}('1',2,2,'X|(0)'.split('|')))";
+        assert_eq!(unpack_packed_js(src).as_deref(), Some("(0)"));
+    }
+
+    #[test]
     fn packed_stream_url_finds_hls_in_packed_js() {
         // Like real pages, the URL is assembled from separate tokens so no complete
         // ".m3u8" exists in the raw payload. Payload `0:"1.2"` with keywords
@@ -323,6 +448,53 @@ mod tests {
         let json2 = r#"{"direct_access_url":"https://cdn.voe/f.mp4?t=y"}"#;
         let html2 = format!(r#"<script type="application/json">["{}"]</script>"#, voe_encode(json2));
         assert_eq!(voe_stream_url(&html2).as_deref(), Some("https://cdn.voe/f.mp4?t=y"));
+    }
+
+    #[test]
+    fn voe_mirror_target_extracts_stub_redirect() {
+        let stub = r#"<script>window.location.href = 'https://othermirror.com/e/abc123';</script>"#;
+        assert_eq!(
+            voe_mirror_target(stub).as_deref(),
+            Some("https://othermirror.com/e/abc123"),
+        );
+        assert!(voe_mirror_target("<html>no redirect</html>").is_none());
+    }
+
+    #[test]
+    fn voe_gate_parses_form_fields() {
+        let html = r#"<form method="POST" action="https://m.com/e/xy" class="access-form">
+            <input type="hidden" name="_token" value="CSRF123">
+            <altcha-widget challenge="https://m.com/chal.json" hidefooter></altcha-widget>
+            </form>"#;
+        let g = voe_gate(html).expect("gate");
+        assert_eq!(g.action, "https://m.com/e/xy");
+        assert_eq!(g.token, "CSRF123");
+        assert_eq!(g.challenge_url, "https://m.com/chal.json");
+        // A normal page (no widget) is not a gate.
+        assert!(voe_gate("<html>video</html>").is_none());
+    }
+
+    #[test]
+    fn voe_pow_solution_satisfies_challenge() {
+        // cost=1 keeps the test fast; keyPrefix "00" ⇒ ~256 tries.
+        let challenge = r#"{"parameters":{"algorithm":"PBKDF2/SHA-256","cost":1,"keyLength":32,"keyPrefix":"00","nonce":"aabbccdd","salt":"11223344"},"signature":"deadbeef"}"#;
+        let b64 = voe_solve_challenge(challenge).expect("solve");
+        let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["challenge"]["signature"], "deadbeef");
+        let counter = v["solution"]["counter"].as_u64().unwrap() as u32;
+        // Re-derive and confirm the proof-of-work actually holds.
+        let mut pw = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        pw.extend_from_slice(&counter.to_be_bytes());
+        let mut out = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(1).unwrap(),
+            &[0x11, 0x22, 0x33, 0x44],
+            &pw,
+            &mut out,
+        );
+        assert_eq!(out[0], 0x00, "derived key must start with keyPrefix");
     }
 
     #[test]

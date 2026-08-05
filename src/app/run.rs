@@ -1028,7 +1028,17 @@ impl Runner {
                 let still_current = self.playing.as_ref() == Some(&(anime, episode));
                 match result {
                     Ok(()) => self.app.set_status("playback finished"),
-                    Err(e) => self.app.set_error(format!("playback error: {e}")),
+                    Err(e) => {
+                        // Name the host so an unsupported/blocked source (e.g. a
+                        // JS-only embed we don't resolve natively) is clear, not a
+                        // bare mpv exit code.
+                        let host = self
+                            .current_source
+                            .as_ref()
+                            .and_then(|s| s.label.clone())
+                            .unwrap_or_else(|| "source".into());
+                        self.app.set_error(format!("{host}: playback failed — {e}"));
+                    }
                 }
                 if still_current {
                     self.playing = None;
@@ -1084,10 +1094,11 @@ impl Runner {
         self.advance_playback().await;
     }
 
-    /// Start the next candidate in `playback_queue`. For the embedded backend a
-    /// synchronous start failure immediately tries the following candidate; for the
-    /// external backend a failure arrives later as `Msg::ExternalEnded`, which calls
-    /// back here. When the queue is exhausted, surface the failure.
+    /// Play the current entry in `playback_queue`. The queue holds exactly the one
+    /// source the user chose (no silent cross-source fallback — that could switch
+    /// VF↔VOSTFR), so this resolves it to a fresh direct URL and starts it; on a
+    /// resolve or embedded-start failure it surfaces the specific error and returns
+    /// to the episode list. (`host_rank` only orders the DEFAULT pick, not fallback.)
     async fn advance_playback(&mut self) {
         let Some((anime, episode)) = self.playing.clone() else {
             return;
@@ -1106,8 +1117,21 @@ impl Runner {
             self.playback_attempt += 1;
             // Resolve the host embed to a FRESH direct URL now (its token is short-
             // lived, so this must happen at play time, not at prefetch/cache time).
+            // A resolve failure carries a host-named reason — show it, don't hand an
+            // unresolved embed page to mpv (which would fail with a cryptic exit).
             let client = self.http.clone();
-            let source = resolve_host_source(&client, source).await;
+            let source = match resolve_host_source(&client, source).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.app.set_error(e.to_string());
+                    if self.app.view == View::Player {
+                        self.app.view = View::Episodes;
+                    }
+                    self.app.loading = false;
+                    self.playing = None;
+                    return;
+                }
+            };
             if self.begin_playback(anime.clone(), episode.clone(), source).await {
                 return; // running (embedded) or spawned (external)
             }
@@ -1584,9 +1608,10 @@ fn pick_default_index(sources: &[PreparedSource], preferred: &str) -> usize {
     0
 }
 
-/// Reliability rank for a source host (lower = try first). yt-dlp resolves
-/// vidmoly (generic) and sibnet (dedicated extractor); voe has no working
-/// extractor today, so it sorts last and is only reached via fallback.
+/// Reliability rank for a source host (lower = the DEFAULT pick when the user
+/// hasn't chosen one). vidmoly/sibnet resolve most reliably here; voe works but its
+/// rotating mirrors make it the least reliable, so it sorts last. This only orders
+/// the default selection — there is no automatic cross-host fallback.
 fn host_rank(label: &str) -> u8 {
     let l = label.to_ascii_lowercase();
     if l.contains("voe") {
@@ -1720,18 +1745,19 @@ async fn dump_embed_pages(client: &reqwest::Client, sources: &[PreparedSource]) 
 /// direct stream URL + the required headers. yt-dlp has no voe/vidmoly extractor and
 /// its sibnet one doesn't yield a playable stream here, so we resolve them ourselves;
 /// anything else passes through unchanged for mpv's ytdl hook.
-async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) -> PreparedSource {
+///
+/// Returns a descriptive `Error::Resolve` when a KNOWN host's page can't be fetched
+/// or no stream can be extracted, so the user is told *why* it failed (host down vs
+/// layout changed) instead of hitting a cryptic mpv exit later. Error text names the
+/// host only — never the resolved URL or headers (secrets).
+async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) -> Result<PreparedSource> {
     let label = s.label.as_deref().unwrap_or("").to_lowercase();
     let host_is = |name: &str| s.url.contains(name) || label.contains(name);
+    let host_name = s.label.clone().unwrap_or_else(|| "source".into());
 
-    // (matcher, page→direct-url extractor, Referer to send for the CDN)
     if host_is("sibnet") {
-        if let Some(html) = fetch_embed(client, &s.url).await {
-            if let Some(direct) = crate::resolver::sibnet_direct_url(&html) {
-                s.url = direct;
-                s.headers = referer(&format!("{}/", crate::resolver::SIBNET_BASE));
-            }
-        }
+        s.url = fetch_and_extract(client, &host_name, &s.url, crate::resolver::sibnet_direct_url).await?;
+        s.headers = referer(&format!("{}/", crate::resolver::SIBNET_BASE));
     } else if host_is("vidmoly")
         || host_is("lulustream")
         || host_is("luluvdo")
@@ -1741,26 +1767,119 @@ async fn resolve_host_source(client: &reqwest::Client, mut s: PreparedSource) ->
         // jwplayer-style hosts: the HLS URL is in the (often p.a.c.k.e.r-packed)
         // player config. The CDN token is IP+time locked; send the embed origin.
         let origin = origin_of(&s.url).unwrap_or_default();
-        if let Some(html) = fetch_embed(client, &s.url).await {
-            if let Some(direct) = crate::resolver::packed_stream_url(&html) {
-                s.url = direct;
-                if !origin.is_empty() {
-                    s.headers = referer(&origin);
-                }
-            }
+        s.url = fetch_and_extract(client, &host_name, &s.url, crate::resolver::packed_stream_url).await?;
+        if !origin.is_empty() {
+            s.headers = referer(&origin);
         }
     } else if host_is("voe") {
-        // VOE is served from rotating mirror domains; the CDN token is IP+time
-        // locked, and the correct Referer is the embed page's own origin.
-        let origin = origin_of(&s.url).unwrap_or_else(|| "https://voe.sx/".into());
-        if let Some(html) = fetch_embed(client, &s.url).await {
-            if let Some(direct) = crate::resolver::voe_stream_url(&html) {
-                s.url = direct;
-                s.headers = referer(&origin);
+        // VOE bounces ~half its embeds to a mirror domain behind a PBKDF2
+        // "confirm you're human" proof-of-work gate; resolve_voe follows the mirror
+        // and solves the gate when present. The CDN token is IP+time locked, so the
+        // Referer is the (final) embed origin.
+        let (stream, origin) = resolve_voe(&host_name, &s.url).await?;
+        s.url = stream;
+        s.headers = referer(&origin);
+    }
+    // Unknown host: pass through unchanged for mpv's ytdl hook.
+
+    // Final safety: any rewritten direct URL must still pass the URL choke point
+    // before it can reach mpv (file:// mock sources are exempt — they never hit a
+    // host matcher above and were already accepted upstream).
+    if !s.url.starts_with("file://") {
+        s.url = crate::resolver::validate_stream_url(&s.url)?;
+    }
+    Ok(s)
+}
+
+/// Browser-like UA for VOE's gate (its DDoS-Guard/anti-bot layer rejects obvious
+/// non-browser clients).
+const VOE_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+/// Resolve a VOE embed to its direct stream URL, returning `(stream_url, referer)`.
+///
+/// VOE serves ~half its embeds directly; the rest redirect to a mirror domain and sit
+/// behind a custom PBKDF2 proof-of-work "human check" (Laravel + DDoS-Guard, session +
+/// CSRF bound). This follows the mirror hop and, when gated, fetches the challenge,
+/// solves the PoW ([`crate::resolver::voe_solve_challenge`]), and POSTs the form to
+/// obtain the real page — all on a private cookie-store client because the gate is
+/// session bound. Errors are host-named so the user sees why it failed.
+async fn resolve_voe(host_name: &str, embed_url: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .user_agent(VOE_UA)
+        .build()
+        .map_err(|e| Error::Network(format!("voe client: {e}")))?;
+
+    let load = |c: reqwest::Client, url: String, referer: String| async move {
+        c.get(&url).header("Referer", referer).send().await.ok()?.text().await.ok()
+    };
+
+    let mut current = embed_url.to_string();
+    let mut page = load(client.clone(), current.clone(), "https://nakanime.tv/".into())
+        .await
+        .ok_or_else(|| {
+            Error::Resolve(format!("{host_name}: could not load the embed page (host down or network error)"))
+        })?;
+
+    // At most: real page | stub→mirror | gate→solve→real. Three passes covers it.
+    for _ in 0..3 {
+        if let Some(stream) = crate::resolver::voe_stream_url(&page) {
+            let origin = origin_of(&current).unwrap_or_else(|| "https://voe.sx/".into());
+            return Ok((stream, origin));
+        }
+        if let Some(gate) = crate::resolver::voe_gate(&page) {
+            let chal = load(client.clone(), gate.challenge_url.clone(), gate.action.clone())
+                .await
+                .ok_or_else(|| Error::Resolve(format!("{host_name}: human-check challenge unavailable")))?;
+            let payload = crate::resolver::voe_solve_challenge(&chal)
+                .ok_or_else(|| Error::Resolve(format!("{host_name}: could not solve the human-check")))?;
+            let origin = origin_of(&gate.action).unwrap_or_default();
+            let resp = client
+                .post(&gate.action)
+                .header("Referer", &gate.action)
+                .header("Origin", origin.trim_end_matches('/'))
+                .form(&[("_token", gate.token.as_str()), ("access", "0"), ("altcha", payload.as_str())])
+                .send()
+                .await
+                .map_err(|e| Error::Network(format!("voe verify: {e}")))?;
+            current = gate.action;
+            page = resp
+                .text()
+                .await
+                .map_err(|e| Error::Network(format!("voe verify body: {e}")))?;
+            continue;
+        }
+        if let Some(mirror) = crate::resolver::voe_mirror_target(&page) {
+            if mirror != current {
+                current = mirror.clone();
+                page = load(client.clone(), mirror, "https://nakanime.tv/".into())
+                    .await
+                    .ok_or_else(|| Error::Resolve(format!("{host_name}: mirror page unavailable")))?;
+                continue;
             }
         }
+        break;
     }
-    s
+    Err(Error::Resolve(format!(
+        "{host_name}: no playable stream found (host page layout may have changed)"
+    )))
+}
+
+/// Fetch a known host's embed page and run its extractor, mapping each failure to a
+/// user-facing, host-named `Error::Resolve` (page-fetch failure vs no-stream-found).
+async fn fetch_and_extract(
+    client: &reqwest::Client,
+    host_name: &str,
+    url: &str,
+    extract: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let html = fetch_embed(client, url).await.ok_or_else(|| {
+        Error::Resolve(format!("{host_name}: could not load the embed page (host down or network error)"))
+    })?;
+    extract(&html).ok_or_else(|| {
+        Error::Resolve(format!("{host_name}: no playable stream found (host page layout may have changed)"))
+    })
 }
 
 /// GET an embed page with the site Referer, returning its body (best-effort).

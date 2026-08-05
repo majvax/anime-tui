@@ -1,6 +1,6 @@
 [package]
 name = "anime-tui"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Terminal client for Nakanime with in-terminal (Kitty graphics) playback via mpv"
@@ -56,6 +56,9 @@ directories = "5"
 async-trait = "0.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
+# PBKDF2 for VOE's "confirm you're human" proof-of-work gate. Already in the tree
+# transitively (rustls); pinned here as a direct dep. See resolver::voe_solve_challenge.
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
