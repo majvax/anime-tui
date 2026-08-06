@@ -24,7 +24,8 @@ OPTIONS:
         --paths          Print config/data/cache directories and exit
         --config <PATH>  Use an alternate config file
 
-Runtime deps: mpv and yt-dlp on PATH. Config is TOML at the path shown by --paths.";
+Runtime deps: mpv and yt-dlp on PATH (ffmpeg too, for downloading HLS episodes).
+Config is TOML at the path shown by --paths.";
 
 /// Parsed command-line options. Kept tiny and dependency-free.
 struct Cli {

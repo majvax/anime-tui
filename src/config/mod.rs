@@ -13,6 +13,11 @@ pub struct Config {
     pub base_url: String,
     /// mpv binary name/path. Spawned with an argument array, never via a shell.
     pub mpv_path: String,
+    /// yt-dlp binary name/path, used to download episodes. Needs ffmpeg on PATH to
+    /// remux HLS (.m3u8) streams to mp4.
+    pub ytdlp_path: String,
+    /// Where downloaded episodes are stored (default: data_dir/downloads).
+    pub download_dir: Option<PathBuf>,
     /// Opt in to embedded in-terminal (Kitty) playback. Default is the standalone
     /// mpv window, which is higher quality and has no terminal image-cache RAM.
     /// Embedded is only used when this is true AND the terminal supports Kitty
@@ -56,6 +61,8 @@ impl Default for Config {
         Self {
             base_url: "https://nakanime.tv".into(),
             mpv_path: "mpv".into(),
+            ytdlp_path: "yt-dlp".into(),
+            download_dir: None,
             embedded_player: false,
             cache_dir: None,
             progress_save_interval_secs: 10,
@@ -114,6 +121,14 @@ impl Config {
 
     pub fn data_dir() -> Result<PathBuf> {
         Ok(Self::dirs()?.data_dir().to_path_buf())
+    }
+
+    /// Directory for downloaded episodes (created on first use by the runner).
+    pub fn download_dir(&self) -> Result<PathBuf> {
+        if let Some(dir) = &self.download_dir {
+            return Ok(dir.clone());
+        }
+        Ok(Self::data_dir()?.join("downloads"))
     }
 
     fn dirs() -> Result<ProjectDirs> {

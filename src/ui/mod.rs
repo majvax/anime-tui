@@ -48,9 +48,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let tab_label = match app.view {
-        View::Home | View::Search => "[ Home ]  Favourites   History ",
-        View::Favourites => "  Home  [ Favourites ]  History ",
-        View::History => "  Home    Favourites  [ History ]",
+        View::Home | View::Search => "[ Home ]  Favourites   History   Downloaded ",
+        View::Favourites => "  Home  [ Favourites ]  History   Downloaded ",
+        View::History => "  Home    Favourites  [ History ]  Downloaded ",
+        View::Downloaded => "  Home    Favourites   History  [ Downloaded ]",
         _ => "",
     };
     let title = if tab_label.is_empty() {
@@ -66,6 +67,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Braille spinner frames for loading indicators.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Nerd-font glyphs for the episode download state. Easy to tweak if your patched
+/// font maps them differently: downloaded (nf-fa-download) / downloading (nf-fa-spinner).
+const DOWNLOADED_ICON: &str = "\u{f019}";
+const DOWNLOADING_ICON: &str = "\u{f110}";
 
 fn spinner_char(frame: usize) -> &'static str {
     SPINNER[frame % SPINNER.len()]
@@ -84,11 +90,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             View::Home | View::Search => {
                 " / search · j/k move · Enter select · S sort · F filter · Tab tab · q quit"
             }
-            View::Favourites | View::History => {
+            View::Favourites | View::History | View::Downloaded => {
                 " j/k move · Enter select · F filter · Tab tab · Esc back · q quit"
             }
             View::Details => " Enter episodes · f toggle favourite · Esc back · q quit",
-            View::Episodes => " Enter play / fold · c choose source · j/k move · Esc back · q quit",
+            View::Episodes => " Enter play · c source · r replay · d download · x delete · Esc back",
             View::Sources => " Enter select source · j/k move · Esc back",
             View::Player => " Space pause · ,/. ±5s · h/l ±10s · i skip intro · g seek · o window · f fullscreen · n/p ep · q stop",
         };
@@ -117,6 +123,7 @@ fn browse_title(app: &App) -> String {
     let base = match app.view {
         View::Favourites => "Favourites",
         View::History => "History",
+        View::Downloaded => "Downloaded",
         _ => "Results",
     };
     let shown = app.results.len();
@@ -143,6 +150,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         let msg = match app.view {
             View::Favourites => "No favourites yet. Press `f` on a details page to add one.",
             View::History => "No history yet. Watch an episode to record it here.",
+            View::Downloaded => "No downloads yet. Press `d` on an episode to download it.",
             _ if app.input_mode => "Type a query and press Enter.",
             _ => "Press `/` to search, or Tab to browse Favourites / History.",
         };
@@ -388,12 +396,20 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     String::new()
                 };
+                // Download state marker (in-progress → done → none).
+                let dl = if app.downloading.contains(&e.id.0) {
+                    format!("{DOWNLOADING_ICON} ")
+                } else if app.downloaded.contains(&e.id.0) {
+                    format!("{DOWNLOADED_ICON} ")
+                } else {
+                    String::new()
+                };
                 // Indent episodes under a season header so the tree reads clearly.
                 let indent = if indented { "  " } else { "" };
                 let label = if title.is_empty() {
-                    format!("{indent}Ep {}{}", e.number, resume_str)
+                    format!("{indent}{dl}Ep {}{}", e.number, resume_str)
                 } else {
-                    format!("{indent}Ep {} - {}{}", e.number, title, resume_str)
+                    format!("{indent}{dl}Ep {} - {}{}", e.number, title, resume_str)
                 };
                 ListItem::new(label)
             }

@@ -88,6 +88,7 @@ pub enum View {
     Episodes,
     Favourites,
     History,
+    Downloaded,
     Player,
 }
 
@@ -130,7 +131,14 @@ pub enum Effect {
     LoadDetails(AnimeId),
     LoadFavourites,
     LoadHistory,
+    LoadDownloads,
     Play(AnimeId, EpisodeId),
+    /// Play the episode from the start, ignoring any saved resume position.
+    Replay(AnimeId, EpisodeId),
+    /// Download the episode for offline playback.
+    Download(AnimeId, EpisodeId),
+    /// Delete the downloaded file for the episode.
+    RemoveDownload(AnimeId, EpisodeId),
     /// Play but always show the source picker (Enter plays the default directly).
     PlayChoose(AnimeId, EpisodeId),
     /// User confirmed a source from the source-selection list (index into runner's pending list).
@@ -204,6 +212,12 @@ pub struct App {
     /// Resume positions keyed by episode_id (populated when details load).
     pub resume_positions: HashMap<String, f64>,
 
+    /// Episode ids with a downloaded local file, for the loaded anime (populated
+    /// when details load). Drives the downloaded icon and local-first playback.
+    pub downloaded: HashSet<String>,
+    /// Episode ids with a download currently in flight (drives the in-progress icon).
+    pub downloading: HashSet<String>,
+
     /// Whether the current anime is in the user's favourites.
     pub is_favourite: bool,
 
@@ -249,6 +263,8 @@ impl Default for App {
             episodes_state: ListState::default(),
             expanded_seasons: HashSet::new(),
             resume_positions: HashMap::new(),
+            downloaded: HashSet::new(),
+            downloading: HashSet::new(),
             is_favourite: false,
             source_labels: Vec::new(),
             source_state: ListState::default(),
@@ -306,6 +322,26 @@ impl App {
             Action::CycleSort if matches!(self.view, View::Home | View::Search) => self.cycle_sort(),
             // Open the source picker for the selected episode (Enter plays default).
             Action::ChooseSource => self.choose_source(),
+            // Re-watch the selected episode from the start (Episodes view).
+            Action::Replay if self.view == View::Episodes => match self.selected_episode_ids() {
+                Some((anime, episode)) => {
+                    self.goto(View::Player);
+                    self.loading = true;
+                    Effect::Replay(anime, episode)
+                }
+                None => Effect::None,
+            },
+            // Download / delete the selected episode (Episodes view).
+            Action::Download if self.view == View::Episodes => match self.selected_episode_ids() {
+                Some((anime, episode)) => Effect::Download(anime, episode),
+                None => Effect::None,
+            },
+            Action::RemoveDownload if self.view == View::Episodes => {
+                match self.selected_episode_ids() {
+                    Some((anime, episode)) => Effect::RemoveDownload(anime, episode),
+                    None => Effect::None,
+                }
+            }
             // Client-side quick-filter is available in any browse list.
             Action::Filter if self.is_browse_view() => {
                 self.filtering = true;
@@ -320,7 +356,7 @@ impl App {
 
     fn on_select(&mut self) -> Effect {
         match self.view {
-            View::Home | View::Search | View::Favourites | View::History => {
+            View::Home | View::Search | View::Favourites | View::History | View::Downloaded => {
                 match self.selected_result() {
                     Some(anime) => {
                         let id = anime.id.clone();
@@ -329,6 +365,7 @@ impl App {
                         self.details = None;
                         self.is_favourite = false;
                         self.resume_positions.clear();
+                        self.downloaded.clear();
                         Effect::LoadDetails(id)
                     }
                     None => Effect::None,
@@ -421,6 +458,12 @@ impl App {
                 Effect::LoadHistory
             }
             View::History => {
+                self.goto(View::Downloaded);
+                self.results.clear();
+                self.loading = true;
+                Effect::LoadDownloads
+            }
+            View::Downloaded => {
                 self.goto(View::Home);
                 self.results.clear();
                 self.loading = true;
@@ -472,7 +515,7 @@ impl App {
     pub fn is_browse_view(&self) -> bool {
         matches!(
             self.view,
-            View::Home | View::Search | View::Favourites | View::History
+            View::Home | View::Search | View::Favourites | View::History | View::Downloaded
         )
     }
 
@@ -654,6 +697,16 @@ impl App {
         }
     }
 
+    /// `(anime_id, episode_id)` for the currently selected episode row, or `None`
+    /// if a season header / nothing is selected or details aren't loaded. Used by
+    /// the replay/download actions.
+    pub fn selected_episode_ids(&self) -> Option<(AnimeId, EpisodeId)> {
+        let index = self.selected_episode_index()?;
+        let d = self.details.as_ref()?;
+        let e = d.episodes.get(index)?;
+        Some((d.id.clone(), e.id.clone()))
+    }
+
     /// Expand the season containing `ep_index` and move the cursor onto that
     /// episode's row. Used when switching episodes during playback (n/p keys).
     pub fn select_episode(&mut self, ep_index: usize) {
@@ -709,7 +762,7 @@ impl App {
     fn back(&mut self) {
         self.input_mode = false;
         self.view = match self.view {
-            View::Home | View::Favourites | View::History => View::Home,
+            View::Home | View::Favourites | View::History | View::Downloaded => View::Home,
             View::Search => View::Home,
             View::Details => View::Home,
             View::Episodes => View::Details,
@@ -860,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_home_favourites_history() {
+    fn tab_cycles_home_favourites_history_downloaded() {
         let mut app = App::default();
         let eff = app.on_action(Action::Tab);
         assert_eq!(app.view, View::Favourites);
@@ -869,8 +922,39 @@ mod tests {
         assert_eq!(app.view, View::History);
         assert_eq!(eff, Effect::LoadHistory);
         let eff = app.on_action(Action::Tab);
+        assert_eq!(app.view, View::Downloaded);
+        assert_eq!(eff, Effect::LoadDownloads);
+        let eff = app.on_action(Action::Tab);
         assert_eq!(app.view, View::Home);
         assert!(matches!(eff, Effect::Search(_)));
+    }
+
+    #[test]
+    fn replay_and_download_actions_target_selected_episode() {
+        let mut app = App::default();
+        seed_details(&mut app);
+        app.goto(View::Episodes); // single-season: row 0 is episode 0
+
+        let eff = app.on_action(Action::Replay);
+        assert_eq!(app.view, View::Player);
+        assert_eq!(eff, Effect::Replay(AnimeId("a1".into()), EpisodeId("e1".into())));
+
+        app.goto(View::Episodes);
+        assert_eq!(
+            app.on_action(Action::Download),
+            Effect::Download(AnimeId("a1".into()), EpisodeId("e1".into()))
+        );
+        assert_eq!(
+            app.on_action(Action::RemoveDownload),
+            Effect::RemoveDownload(AnimeId("a1".into()), EpisodeId("e1".into()))
+        );
+    }
+
+    #[test]
+    fn replay_outside_episodes_is_noop() {
+        let mut app = App::default();
+        assert_eq!(app.on_action(Action::Replay), Effect::None);
+        assert_eq!(app.view, View::Home);
     }
 
     #[test]

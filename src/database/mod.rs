@@ -3,8 +3,9 @@
 
 use crate::errors::{Error, Result};
 use crate::models::AnimeSummary;
-use crate::models::AnimeId;
+use crate::models::{AnimeDetails, AnimeId};
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::Path;
 
 pub struct Database {
@@ -42,6 +43,25 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS downloads (
+    provider      TEXT NOT NULL,
+    anime_id      TEXT NOT NULL,
+    episode_id    TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    downloaded_at INTEGER NOT NULL,
+    PRIMARY KEY (provider, anime_id, episode_id)
+);
+
+-- Full AnimeDetails (episode list + metadata) as JSON, so the Downloaded tab and
+-- its episodes work with no network. Written whenever details load successfully.
+CREATE TABLE IF NOT EXISTS anime_details_cache (
+    provider  TEXT NOT NULL,
+    anime_id  TEXT NOT NULL,
+    json      TEXT NOT NULL,
+    cached_at INTEGER NOT NULL,
+    PRIMARY KEY (provider, anime_id)
 );
 "#;
 
@@ -247,6 +267,124 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| Error::Database(e.to_string()))
     }
+
+    /// Record a completed download (episode → local file path). Atomic upsert.
+    pub fn add_download(
+        &self,
+        provider: &str,
+        anime: &str,
+        episode: &str,
+        path: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO downloads (provider, anime_id, episode_id, path, downloaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, anime_id, episode_id)
+             DO UPDATE SET path = excluded.path, downloaded_at = excluded.downloaded_at",
+            rusqlite::params![provider, anime, episode, path, now_unix()],
+        ).map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a download record, returning the stored file path (so the caller can
+    /// remove the file). `Ok(None)` if nothing was recorded.
+    pub fn remove_download(&self, provider: &str, anime: &str, episode: &str) -> Result<Option<String>> {
+        let path = self.download_path(provider, anime, episode)?;
+        if path.is_some() {
+            self.conn.execute(
+                "DELETE FROM downloads WHERE provider=?1 AND anime_id=?2 AND episode_id=?3",
+                rusqlite::params![provider, anime, episode],
+            ).map_err(|e| Error::Database(e.to_string()))?;
+        }
+        Ok(path)
+    }
+
+    /// Local file path for a downloaded episode, if any.
+    pub fn download_path(&self, provider: &str, anime: &str, episode: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT path FROM downloads WHERE provider=?1 AND anime_id=?2 AND episode_id=?3",
+                rusqlite::params![provider, anime, episode],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Database(other.to_string())),
+            })
+    }
+
+    /// Episode ids that have a downloaded file, for a given anime.
+    pub fn downloaded_episodes_for_anime(&self, provider: &str, anime: &str) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT episode_id FROM downloads WHERE provider=?1 AND anime_id=?2",
+        ).map_err(|e| Error::Database(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![provider, anime], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Database(e.to_string()))?;
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row.map_err(|e| Error::Database(e.to_string()))?);
+        }
+        Ok(set)
+    }
+
+    /// Distinct anime that have at least one downloaded episode, joined with cached
+    /// metadata (title/poster), sorted by title. Same shape as `list_favourites`.
+    pub fn list_downloaded_anime(&self, provider: &str) -> Result<Vec<AnimeSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT d.anime_id, COALESCE(ac.title, d.anime_id), ac.year, ac.poster_url
+             FROM downloads d
+             LEFT JOIN anime_cache ac ON ac.provider = d.provider AND ac.anime_id = d.anime_id
+             WHERE d.provider = ?1
+             ORDER BY COALESCE(ac.title, d.anime_id) COLLATE NOCASE",
+        ).map_err(|e| Error::Database(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![provider], |row| {
+            Ok(AnimeSummary {
+                id: AnimeId(row.get::<_, String>(0)?),
+                title: row.get(1)?,
+                poster_url: row.get::<_, Option<String>>(3)?,
+                year: row.get::<_, Option<i64>>(2)?.map(|y| y as u16),
+            })
+        }).map_err(|e| Error::Database(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Database(e.to_string()))
+    }
+
+    /// Persist an anime's full details (episode list + metadata) as JSON so it can
+    /// be browsed offline. Atomic upsert.
+    pub fn cache_details(&self, provider: &str, details: &AnimeDetails) -> Result<()> {
+        let json = serde_json::to_string(details)
+            .map_err(|e| Error::Database(format!("serialise details: {e}")))?;
+        self.conn.execute(
+            "INSERT INTO anime_details_cache (provider, anime_id, json, cached_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider, anime_id)
+             DO UPDATE SET json = excluded.json, cached_at = excluded.cached_at",
+            rusqlite::params![provider, details.id.0, json, now_unix()],
+        ).map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Cached details for an anime, if previously loaded. Powers offline browsing.
+    pub fn cached_details(&self, provider: &str, anime: &str) -> Result<Option<AnimeDetails>> {
+        let json: Option<String> = self.conn
+            .query_row(
+                "SELECT json FROM anime_details_cache WHERE provider=?1 AND anime_id=?2",
+                rusqlite::params![provider, anime],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Database(other.to_string())),
+            })?;
+        match json {
+            Some(s) => serde_json::from_str(&s)
+                .map(Some)
+                .map_err(|e| Error::Database(format!("parse cached details: {e}"))),
+            None => Ok(None),
+        }
+    }
 }
 
 fn now_unix() -> i64 {
@@ -341,6 +479,56 @@ mod tests {
         db.toggle_favourite("mock", "a1", "One").unwrap();
         let favs = db.list_favourites("mock").unwrap();
         assert_eq!(favs[0].poster_url.as_deref(), Some("https://img/p.jpg"));
+    }
+
+    #[test]
+    fn downloads_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.download_path("mock", "a1", "e1").unwrap(), None);
+        assert!(db.downloaded_episodes_for_anime("mock", "a1").unwrap().is_empty());
+
+        db.add_download("mock", "a1", "e1", "/dl/a1_e1.mp4").unwrap();
+        db.add_download("mock", "a1", "e2", "/dl/a1_e2.mp4").unwrap();
+        assert_eq!(db.download_path("mock", "a1", "e1").unwrap().as_deref(), Some("/dl/a1_e1.mp4"));
+        let set = db.downloaded_episodes_for_anime("mock", "a1").unwrap();
+        assert!(set.contains("e1") && set.contains("e2") && set.len() == 2);
+
+        // Listed as one anime (needs cached title), sorted.
+        db.cache_anime("mock", "a1", "Anime One", Some(2021), None).unwrap();
+        let list = db.list_downloaded_anime("mock").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "Anime One");
+
+        // Removing returns the path so the file can be deleted; then it's gone.
+        assert_eq!(db.remove_download("mock", "a1", "e1").unwrap().as_deref(), Some("/dl/a1_e1.mp4"));
+        assert_eq!(db.download_path("mock", "a1", "e1").unwrap(), None);
+        assert_eq!(db.remove_download("mock", "a1", "e1").unwrap(), None);
+    }
+
+    #[test]
+    fn details_cache_roundtrip() {
+        use crate::models::{AnimeDetails, Episode, EpisodeId};
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.cached_details("mock", "a1").unwrap().is_none());
+        let details = AnimeDetails {
+            id: AnimeId("a1".into()),
+            title: "T".into(),
+            description: Some("d".into()),
+            poster_url: None,
+            genres: vec!["action".into()],
+            status: None,
+            episodes: vec![Episode {
+                id: EpisodeId("e1".into()),
+                number: "1".into(),
+                title: None,
+                season_id: Some(3),
+            }],
+        };
+        db.cache_details("mock", &details).unwrap();
+        let got = db.cached_details("mock", "a1").unwrap().unwrap();
+        assert_eq!(got.title, "T");
+        assert_eq!(got.episodes.len(), 1);
+        assert_eq!(got.episodes[0].season_id, Some(3));
     }
 
     #[test]

@@ -26,6 +26,13 @@ pub enum Action {
     /// Open the source picker for the selected episode (Episodes view). Plain Enter
     /// plays the default source directly; this key lets you choose another.
     ChooseSource,
+    /// Play the selected episode from the start, ignoring any saved resume position
+    /// (Episodes view). For re-watching a finished episode.
+    Replay,
+    /// Download the selected episode for offline playback (Episodes view).
+    Download,
+    /// Delete the downloaded file for the selected episode (Episodes view).
+    RemoveDownload,
     // Playback
     PlayPause,
     SeekForward,
@@ -61,6 +68,9 @@ pub fn default_binding(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         Char('S') => Action::CycleSort,
         Char('F') => Action::Filter,
         Char('c') => Action::ChooseSource,
+        Char('r') => Action::Replay,
+        Char('d') => Action::Download,
+        Char('x') => Action::RemoveDownload,
         Char(' ') => Action::PlayPause,
         Char('m') => Action::Mute,
         Char('n') => Action::NextEpisode,

@@ -192,6 +192,36 @@ pub fn build_args(
     args
 }
 
+/// Build the yt-dlp argument vector to download `url` to `out_path` (mp4). Pure +
+/// no IO so it's auditable and unit-testable, and spawned as an argument array
+/// (never a shell). `headers` (Referer/cookies) are sensitive — never log this.
+///
+/// HLS (.m3u8) sources need ffmpeg on PATH for the mp4 remux.
+pub fn ytdlp_args(out_path: &str, url: &str, headers: &[(String, String)]) -> Vec<String> {
+    let mut args = vec![
+        "--no-playlist".into(),
+        "--no-part".into(),
+        "--no-progress".into(),
+        "--force-overwrites".into(),
+        "--merge-output-format".into(),
+        "mp4".into(),
+        "-o".into(),
+        out_path.to_string(),
+    ];
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("referer") {
+            args.push("--referer".into());
+            args.push(v.clone());
+        } else {
+            args.push("--add-header".into());
+            args.push(format!("{k}: {v}"));
+        }
+    }
+    args.push("--".into());
+    args.push(url.to_string());
+    args
+}
+
 /// True when `url` already points at a direct media stream (HLS/mp4/mkv), ignoring
 /// any query string — so mpv should play it without invoking its ytdl hook.
 fn is_direct_media(url: &str) -> bool {
@@ -364,6 +394,24 @@ mod tests {
         // Only the comma-free header survives, and it's the whole field value.
         assert!(a.iter().any(|s| s == "--http-header-fields=Referer: https://ref"));
         assert!(!a.iter().any(|s| s.contains("Accept")));
+    }
+
+    #[test]
+    fn ytdlp_args_carry_output_headers_and_url() {
+        let h = vec![
+            ("Referer".into(), "https://ref/".into()),
+            ("User-Agent".into(), "Mozilla/5.0".into()),
+        ];
+        let a = ytdlp_args("/dl/out.mp4", "https://cdn/x/master.m3u8?t=tok", &h);
+        // Output path present.
+        let o = a.iter().position(|s| s == "-o").unwrap();
+        assert_eq!(a[o + 1], "/dl/out.mp4");
+        // Referer becomes --referer; other headers become --add-header "K: V".
+        assert!(a.windows(2).any(|w| w[0] == "--referer" && w[1] == "https://ref/"));
+        assert!(a.windows(2).any(|w| w[0] == "--add-header" && w[1] == "User-Agent: Mozilla/5.0"));
+        // URL is last, separated by `--`.
+        assert_eq!(a.last().unwrap(), "https://cdn/x/master.m3u8?t=tok");
+        assert_eq!(a[a.len() - 2], "--");
     }
 
     #[test]

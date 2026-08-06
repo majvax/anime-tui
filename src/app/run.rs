@@ -48,6 +48,13 @@ enum Msg {
     Details(Result<AnimeDetails>),
     Favourites(Result<Vec<AnimeSummary>>),
     History(Result<Vec<AnimeSummary>>),
+    Downloads(Result<Vec<AnimeSummary>>),
+    /// A background episode download finished. `Ok` carries the local file path.
+    Downloaded {
+        anime: AnimeId,
+        episode: EpisodeId,
+        result: Result<String>,
+    },
     Resolved {
         anime: AnimeId,
         episode: EpisodeId,
@@ -181,6 +188,14 @@ pub struct Runner {
     /// True when we auto-paused embedded playback on terminal focus loss (so we
     /// only auto-resume what we paused, never a manual pause). See on_terminal_event.
     focus_paused: bool,
+
+    /// When set, the next `begin_playback` starts at 0 instead of the saved resume
+    /// position (the Replay action). Consumed on use.
+    restart_next: bool,
+    /// Where downloaded episodes are written.
+    download_dir: std::path::PathBuf,
+    /// yt-dlp binary used for downloads.
+    ytdlp_path: String,
 }
 
 impl Runner {
@@ -258,6 +273,11 @@ impl Runner {
             },
             input_conf_path,
             focus_paused: false,
+            restart_next: false,
+            download_dir: config
+                .download_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("anime-tui-downloads")),
+            ytdlp_path: config.ytdlp_path.clone(),
         })
     }
 
@@ -419,7 +439,7 @@ impl Runner {
     fn in_browse_view(&self) -> bool {
         matches!(
             self.app.view,
-            View::Home | View::Search | View::Favourites | View::History
+            View::Home | View::Search | View::Favourites | View::History | View::Downloaded
         )
     }
 
@@ -834,6 +854,12 @@ impl Runner {
                 if let Some(url) = self.last_poster_url.clone() {
                     self.fetch_poster(id.clone(), url);
                 }
+                // Offline-first: if we have cached details, show them immediately so
+                // the Downloaded tab works with no network. The network refresh below
+                // upgrades them if it succeeds, or is ignored on failure.
+                if let Ok(Some(cached)) = self.db.cached_details(self.provider.name(), &id.0) {
+                    let _ = self.tx.send(Msg::Details(Ok(cached)));
+                }
                 let (provider, tx) = (self.provider.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     let _ = tx.send(Msg::Details(provider.details(&id).await));
@@ -860,8 +886,26 @@ impl Runner {
                     }
                 }
             }
+            Effect::LoadDownloads => {
+                match self.db.list_downloaded_anime(self.provider.name()) {
+                    Ok(list) => {
+                        let _ = self.tx.send(Msg::Downloads(Ok(list)));
+                    }
+                    Err(e) => {
+                        let _ = self.tx.send(Msg::Downloads(Err(e)));
+                    }
+                }
+            }
             Effect::Play(anime, episode) => self.dispatch_resolve(anime, episode, false),
             Effect::PlayChoose(anime, episode) => self.dispatch_resolve(anime, episode, true),
+            Effect::Replay(anime, episode) => {
+                // Force the next begin_playback to start at 0, ignoring the saved
+                // resume position (which for a finished episode is ~its duration).
+                self.restart_next = true;
+                self.dispatch_resolve(anime, episode, false);
+            }
+            Effect::Download(anime, episode) => self.start_download(anime, episode),
+            Effect::RemoveDownload(anime, episode) => self.remove_download(anime, episode),
             Effect::SelectSource(i) => {
                 // Use the (anime, episode) pair captured when the sources were
                 // resolved. Do NOT recompute from `episodes_state.selected()`:
@@ -895,6 +939,27 @@ impl Runner {
     /// report them back as `Msg::Resolved`. `choose` requests the source picker;
     /// otherwise the configured default source is played directly.
     fn dispatch_resolve(&mut self, anime: AnimeId, episode: EpisodeId, choose: bool) {
+        // Play a downloaded episode from its local file by default (Enter). The
+        // explicit source picker (`c`) still resolves online. Flows through the
+        // existing file:// handling in resolve_host_source / build_args.
+        if !choose {
+            if let Ok(Some(path)) = self.db.download_path(self.provider.name(), &anime.0, &episode.0) {
+                if std::path::Path::new(&path).exists() {
+                    let source = PreparedSource {
+                        url: format!("file://{path}"),
+                        headers: vec![],
+                        label: Some("downloaded".into()),
+                    };
+                    let _ = self.tx.send(Msg::Resolved {
+                        anime,
+                        episode,
+                        result: Ok(vec![source]),
+                        choose,
+                    });
+                    return;
+                }
+            }
+        }
         // Fast path: the episode was prefetched while hovering — play now.
         if let Some(sources) = self.source_cache.get(&episode.0).cloned() {
             let _ = self.tx.send(Msg::Resolved { anime, episode, result: Ok(sources), choose });
@@ -923,7 +988,8 @@ impl Runner {
                 self.app.set_status(format!("load more failed: {e}"));
             }
             Msg::Details(Ok(details)) => {
-                // Cache title + cover so history/favourites can show them later.
+                // Cache title + cover so history/favourites can show them later, and
+                // the full details JSON so the Downloaded tab works offline.
                 let _ = self.db.cache_anime(
                     self.provider.name(),
                     &details.id.0,
@@ -931,34 +997,71 @@ impl Runner {
                     None,
                     details.poster_url.as_deref(),
                 );
-                // Load resume positions and favourite flag.
-                self.app.resume_positions = self
-                    .db
-                    .resume_positions_for_anime(self.provider.name(), &details.id.0)
-                    .unwrap_or_default();
-                self.app.is_favourite = self
-                    .db
-                    .is_favourite(self.provider.name(), &details.id.0)
-                    .unwrap_or(false);
-                // New anime: drop any prefetched sources from the previous one,
-                // then queue the resume episode and the next one for warming.
-                self.source_cache.clear();
-                self.prefetch_target = None;
-                self.prefetch_queue.clear();
-                self.queue_resume_prefetch(&details);
-                // The poster was already kicked off from the summary URL in
-                // LoadDetails; upgrade to the details cover (higher-res extraLarge)
-                // only when it's a different URL — no reset, so the fast cover isn't
-                // blanked, and no redundant fetch when the URLs match.
-                if let Some(url) = details.poster_url.clone() {
-                    if self.last_poster_url.as_deref() != Some(url.as_str()) {
-                        self.last_poster_url = Some(url.clone());
-                        self.fetch_poster(details.id.clone(), url);
+                let _ = self.db.cache_details(self.provider.name(), &details);
+                self.load_episode_markers(&details.id.0);
+                // The instant offline-cache render (from LoadDetails) may have already
+                // shown this exact anime; a later network refresh that matches must NOT
+                // reset the fold/selection the user is interacting with. Only do the
+                // full (re)build — clearing caches, re-queuing prefetch, set_details —
+                // when this is a genuinely new/changed episode list.
+                let already_shown = self.app.details.as_ref().is_some_and(|d| {
+                    d.id == details.id && d.episodes.len() == details.episodes.len()
+                });
+                if !already_shown {
+                    // New anime: drop any prefetched sources from the previous one,
+                    // then queue the resume episode and the next one for warming.
+                    self.source_cache.clear();
+                    self.prefetch_target = None;
+                    self.prefetch_queue.clear();
+                    self.queue_resume_prefetch(&details);
+                    // The poster was already kicked off from the summary URL in
+                    // LoadDetails; upgrade to the details cover (higher-res extraLarge)
+                    // only when it's a different URL — no reset, so the fast cover isn't
+                    // blanked, and no redundant fetch when the URLs match.
+                    if let Some(url) = details.poster_url.clone() {
+                        if self.last_poster_url.as_deref() != Some(url.as_str()) {
+                            self.last_poster_url = Some(url.clone());
+                            self.fetch_poster(details.id.clone(), url);
+                        }
                     }
+                    self.app.set_details(details);
                 }
-                self.app.set_details(details);
             }
-            Msg::Details(Err(e)) => self.fail(e),
+            Msg::Details(Err(e)) => {
+                // If cached details are already on screen (offline-first render from
+                // LoadDetails), the failed network refresh is non-fatal — stay on the
+                // saved copy. Otherwise surface the error.
+                if self.app.details.is_some() {
+                    self.app.loading = false;
+                    self.app.set_status("offline — showing saved details");
+                } else {
+                    self.fail(e);
+                }
+            }
+            Msg::Downloads(Ok(list)) => {
+                self.free_thumb_images();
+                self.app.set_results(list);
+            }
+            Msg::Downloads(Err(e)) => self.fail(e),
+            Msg::Downloaded { anime, episode, result } => {
+                self.app.downloading.remove(&episode.0);
+                match result {
+                    Ok(path) => {
+                        let _ = self.db.add_download(
+                            self.provider.name(),
+                            &anime.0,
+                            &episode.0,
+                            &path,
+                        );
+                        // Reflect the new download in the list if it's the loaded anime.
+                        if self.app.details.as_ref().map(|d| d.id.0.as_str()) == Some(anime.0.as_str()) {
+                            self.app.downloaded.insert(episode.0.clone());
+                        }
+                        self.app.set_status("downloaded");
+                    }
+                    Err(e) => self.app.set_error(format!("download failed: {e}")),
+                }
+            }
             Msg::Favourites(Ok(favs)) => {
                 self.free_thumb_images();
                 self.app.set_results(favs);
@@ -1153,12 +1256,18 @@ impl Runner {
             p.stop().await;
         }
 
-        let resume = self
-            .db
-            .resume_position(self.provider.name(), &anime.0, &episode.0)
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
+        // Replay (the `r` key) forces a start at 0, ignoring the saved resume — for a
+        // finished episode the saved position is ~its duration, which would EOF mpv
+        // immediately. Consumed here so it applies to exactly one playback.
+        let resume = if std::mem::take(&mut self.restart_next) {
+            0.0
+        } else {
+            self.db
+                .resume_position(self.provider.name(), &anime.0, &episode.0)
+                .ok()
+                .flatten()
+                .unwrap_or(0.0)
+        };
 
         self.app.loading = false;
         self.app.playback = Some(PlaybackState::default());
@@ -1413,6 +1522,72 @@ impl Runner {
             }
         }
         self.start_prefetch(anime, episode);
+    }
+
+    /// Load resume positions, the favourite flag, and the downloaded-episode set
+    /// for `anime_id` into the App — the markers shown in the Episodes view.
+    fn load_episode_markers(&mut self, anime_id: &str) {
+        let name = self.provider.name();
+        self.app.resume_positions = self
+            .db
+            .resume_positions_for_anime(name, anime_id)
+            .unwrap_or_default();
+        self.app.is_favourite = self.db.is_favourite(name, anime_id).unwrap_or(false);
+        self.app.downloaded = self
+            .db
+            .downloaded_episodes_for_anime(name, anime_id)
+            .unwrap_or_default();
+    }
+
+    /// Kick off a background download of an episode (resolve → yt-dlp). No-op if it's
+    /// already downloaded or a download is already in flight.
+    fn start_download(&mut self, anime: AnimeId, episode: EpisodeId) {
+        if self.app.downloaded.contains(&episode.0) {
+            self.app.set_status("already downloaded");
+            return;
+        }
+        if !self.app.downloading.insert(episode.0.clone()) {
+            self.app.set_status("download already in progress");
+            return;
+        }
+        let safe = |s: &str| -> String {
+            s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+        };
+        let out = self
+            .download_dir
+            .join(format!("{}_{}_{}.mp4", self.provider.name(), safe(&anime.0), safe(&episode.0)));
+        self.app.set_status("downloading…");
+        let (provider, tx, client, ytdlp, default_source) = (
+            self.provider.clone(),
+            self.tx.clone(),
+            self.http.clone(),
+            self.ytdlp_path.clone(),
+            self.default_source.clone(),
+        );
+        tokio::spawn(async move {
+            let result = download_episode(
+                &ytdlp, &client, &*provider, &anime, &episode, &out, &default_source,
+            )
+            .await;
+            let _ = tx.send(Msg::Downloaded { anime, episode, result });
+        });
+    }
+
+    /// Delete a downloaded episode's file + record. Refreshes the Downloaded tab if
+    /// that's the current view.
+    fn remove_download(&mut self, anime: AnimeId, episode: EpisodeId) {
+        match self.db.remove_download(self.provider.name(), &anime.0, &episode.0) {
+            Ok(Some(path)) => {
+                let _ = std::fs::remove_file(&path);
+                self.app.downloaded.remove(&episode.0);
+                self.app.set_status("download removed");
+                if self.app.view == View::Downloaded {
+                    self.dispatch(Effect::LoadDownloads);
+                }
+            }
+            Ok(None) => self.app.set_status("not downloaded"),
+            Err(e) => self.app.set_error(format!("remove failed: {e}")),
+        }
     }
 
     /// Reload the resume-position markers shown in the episode list for the
@@ -1739,6 +1914,47 @@ async fn dump_embed_pages(client: &reqwest::Client, sources: &[PreparedSource]) 
         }
     }
     let _ = tokio::fs::write(dir.join("sources.txt"), manifest).await;
+}
+
+/// Download an episode to `out` via yt-dlp. Resolves the default source to a fresh
+/// direct URL (+ headers) exactly like play-time, then hands it to yt-dlp (which
+/// downloads the HLS/mp4 directly — no yt-dlp extractor needed). Returns the output
+/// path on success. HLS sources need ffmpeg on PATH for the mp4 remux.
+///
+/// Secrets discipline: the resolved URL and headers are sensitive — never logged.
+async fn download_episode(
+    ytdlp: &str,
+    client: &reqwest::Client,
+    provider: &dyn Provider,
+    anime: &AnimeId,
+    episode: &EpisodeId,
+    out: &std::path::Path,
+    default_source: &str,
+) -> Result<String> {
+    let sources = resolve_and_prepare(client, provider, anime, episode).await?;
+    if sources.is_empty() {
+        return Err(Error::Resolve("no sources to download".into()));
+    }
+    let idx = pick_default_index(&sources, default_source);
+    let source = resolve_host_source(client, sources[idx].clone()).await?;
+    if let Some(dir) = out.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| Error::Player(format!("create download dir: {e}")))?;
+    }
+    let out_str = out.to_string_lossy().into_owned();
+    let args = crate::player::mpv::ytdlp_args(&out_str, &source.url, &source.headers);
+    let status = tokio::process::Command::new(ytdlp)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| Error::Player(format!("failed to launch yt-dlp: {e}")))?;
+    if status.success() {
+        Ok(out_str)
+    } else {
+        Err(Error::Player(format!("yt-dlp exited with {status}")))
+    }
 }
 
 /// For hosts we support natively, fetch the embed page and rewrite the source to a
