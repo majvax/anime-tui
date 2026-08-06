@@ -13,7 +13,7 @@ conflicts=('anime-tui')
 # Static musl binary from the GitHub Release for this tag.
 source=("$_pkgname-$pkgver-x86_64-unknown-linux-musl.tar.gz::$url/releases/download/v$pkgver/anime-tui-x86_64-unknown-linux-musl.tar.gz")
 # Replace with the release artifact's SHA-256 (see packaging/update-aur.sh).
-sha256sums=('12e25abde6563bf767ab8e7b7170df6dbbac0ca56548c7543bc9e3f2f573e5fa')
+sha256sums=('815ac9952f59ae01cac2b404be7d4beb887628ea86a97f65a07bca8556fb960f')
 
 package() {
     install -Dm755 "anime-tui" "$pkgdir/usr/bin/anime-tui"
