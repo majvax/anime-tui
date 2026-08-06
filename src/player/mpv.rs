@@ -203,6 +203,11 @@ pub fn ytdlp_args(out_path: &str, url: &str, headers: &[(String, String)]) -> Ve
         "--no-part".into(),
         "--no-progress".into(),
         "--force-overwrites".into(),
+        // HLS sources are hundreds of small fragments; the native downloader fetches
+        // them serially, which dominates download time on these slow hosts. Pull
+        // several in parallel for a large speedup (polite cap of 8).
+        "--concurrent-fragments".into(),
+        "8".into(),
         "--merge-output-format".into(),
         "mp4".into(),
         "-o".into(),
@@ -406,6 +411,8 @@ mod tests {
         // Output path present.
         let o = a.iter().position(|s| s == "-o").unwrap();
         assert_eq!(a[o + 1], "/dl/out.mp4");
+        // Parallel fragment download for HLS speed.
+        assert!(a.windows(2).any(|w| w[0] == "--concurrent-fragments" && w[1] == "8"));
         // Referer becomes --referer; other headers become --add-header "K: V".
         assert!(a.windows(2).any(|w| w[0] == "--referer" && w[1] == "https://ref/"));
         assert!(a.windows(2).any(|w| w[0] == "--add-header" && w[1] == "User-Agent: Mozilla/5.0"));
