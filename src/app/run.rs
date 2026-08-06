@@ -1944,16 +1944,29 @@ async fn download_episode(
     }
     let out_str = out.to_string_lossy().into_owned();
     let args = crate::player::mpv::ytdlp_args(&out_str, &source.url, &source.headers);
-    let status = tokio::process::Command::new(ytdlp)
+    // Capture yt-dlp's output (never inherit): it shares the terminal with ratatui,
+    // so inherited stdout/stderr would paint over the TUI. On failure, surface the
+    // last error line so the reason is visible without a corrupted screen.
+    let output = tokio::process::Command::new(ytdlp)
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .status()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .await
         .map_err(|e| Error::Player(format!("failed to launch yt-dlp: {e}")))?;
-    if status.success() {
+    if output.status.success() {
         Ok(out_str)
     } else {
-        Err(Error::Player(format!("yt-dlp exited with {status}")))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERROR") || l.contains("error"))
+            .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
+            .unwrap_or("no output")
+            .trim();
+        Err(Error::Player(format!("yt-dlp {}: {reason}", output.status)))
     }
 }
 
