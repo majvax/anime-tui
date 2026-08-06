@@ -905,6 +905,19 @@ impl Runner {
                 self.dispatch_resolve(anime, episode, false);
             }
             Effect::Download(anime, episode) => self.start_download(anime, episode),
+            Effect::DownloadSource(i) => {
+                // Download the exact source chosen in the picker. `playing` holds the
+                // (anime, episode) captured when the picker opened.
+                if let (Some(source), Some((anime, episode))) =
+                    (self.pending_sources.get(i).cloned(), self.playing.clone())
+                {
+                    self.spawn_download(anime, episode, Some(source));
+                    // Close the picker; the episode list shows the progress icon. Clear
+                    // `playing` (we're not starting playback) so prefetch isn't blocked.
+                    self.playing = None;
+                    self.app.view = View::Episodes;
+                }
+            }
             Effect::RemoveDownload(anime, episode) => self.remove_download(anime, episode),
             Effect::SelectSource(i) => {
                 // Use the (anime, episode) pair captured when the sources were
@@ -1539,9 +1552,15 @@ impl Runner {
             .unwrap_or_default();
     }
 
-    /// Kick off a background download of an episode (resolve → yt-dlp). No-op if it's
-    /// already downloaded or a download is already in flight.
+    /// Download the episode's default source (the `d` key).
     fn start_download(&mut self, anime: AnimeId, episode: EpisodeId) {
+        self.spawn_download(anime, episode, None);
+    }
+
+    /// Kick off a background download of an episode. `chosen` is a specific source
+    /// picked from the source list (`d` in the picker); `None` downloads the default
+    /// source. No-op if it's already downloaded or a download is already in flight.
+    fn spawn_download(&mut self, anime: AnimeId, episode: EpisodeId, chosen: Option<PreparedSource>) {
         if self.app.downloaded.contains(&episode.0) {
             self.app.set_status("already downloaded");
             return;
@@ -1565,10 +1584,13 @@ impl Runner {
             self.default_source.clone(),
         );
         tokio::spawn(async move {
-            let result = download_episode(
-                &ytdlp, &client, &*provider, &anime, &episode, &out, &default_source,
-            )
-            .await;
+            let result = match chosen {
+                Some(src) => download_one(&ytdlp, &client, src, &out).await,
+                None => {
+                    download_episode(&ytdlp, &client, &*provider, &anime, &episode, &out, &default_source)
+                        .await
+                }
+            };
             let _ = tx.send(Msg::Downloaded { anime, episode, result });
         });
     }
@@ -1936,7 +1958,17 @@ async fn download_episode(
         return Err(Error::Resolve("no sources to download".into()));
     }
     let idx = pick_default_index(&sources, default_source);
-    let source = resolve_host_source(client, sources[idx].clone()).await?;
+    download_one(ytdlp, client, sources[idx].clone(), out).await
+}
+
+/// Resolve one specific source's embed to a fresh direct URL, then download it.
+async fn download_one(
+    ytdlp: &str,
+    client: &reqwest::Client,
+    source: PreparedSource,
+    out: &std::path::Path,
+) -> Result<String> {
+    let source = resolve_host_source(client, source).await?;
     if let Some(dir) = out.parent() {
         tokio::fs::create_dir_all(dir)
             .await

@@ -95,7 +95,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
             View::Details => " Enter episodes · f toggle favourite · Esc back · q quit",
             View::Episodes => " Enter play · c source · r replay · d download · x delete · Esc back",
-            View::Sources => " Enter select source · j/k move · Esc back",
+            View::Sources => " Enter play · d download · j/k move · Esc back",
             View::Player => " Space pause · ,/. ±5s · h/l ±10s · i skip intro · g seek · o window · f fullscreen · n/p ep · q stop",
         };
         match app.status.as_deref() {

@@ -137,6 +137,9 @@ pub enum Effect {
     Replay(AnimeId, EpisodeId),
     /// Download the episode for offline playback.
     Download(AnimeId, EpisodeId),
+    /// Download a specific source chosen from the source picker (index into the
+    /// runner's pending list), rather than the default.
+    DownloadSource(usize),
     /// Delete the downloaded file for the episode.
     RemoveDownload(AnimeId, EpisodeId),
     /// Play but always show the source picker (Enter plays the default directly).
@@ -335,6 +338,12 @@ impl App {
             Action::Download if self.view == View::Episodes => match self.selected_episode_ids() {
                 Some((anime, episode)) => Effect::Download(anime, episode),
                 None => Effect::None,
+            },
+            // In the source picker, `d` downloads the highlighted source instead of
+            // playing it (Enter plays).
+            Action::Download if self.view == View::Sources => match self.source_state.selected() {
+                Some(i) if i < self.source_labels.len() => Effect::DownloadSource(i),
+                _ => Effect::None,
             },
             Action::RemoveDownload if self.view == View::Episodes => {
                 match self.selected_episode_ids() {
@@ -910,6 +919,17 @@ mod tests {
         app.on_action(Action::Down);
         let eff = app.on_action(Action::Select);
         assert_eq!(eff, Effect::SelectSource(1));
+    }
+
+    #[test]
+    fn picker_download_key_targets_highlighted_source() {
+        let mut app = App::default();
+        app.set_sources(vec!["vidmoly (VF)".into(), "sibnet (VF)".into()]);
+        assert_eq!(app.view, View::Sources);
+        // Enter plays the highlighted source; `d` downloads it instead.
+        assert_eq!(app.on_action(Action::Select), Effect::SelectSource(0));
+        app.on_action(Action::Down);
+        assert_eq!(app.on_action(Action::Download), Effect::DownloadSource(1));
     }
 
     #[test]
