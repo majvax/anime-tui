@@ -124,6 +124,15 @@ pub fn build_args(
 
     match presentation {
         Presentation::External { input_conf } => {
+            // Pure-black letterbox bars (OLED-friendly). mpv's default draws the
+            // uncovered/border area as a light-grey checkerboard: --background
+            // defaults to `tiles`, and --border-background=color (black) only
+            // applies on vo=gpu-next — on plain vo=gpu the border falls back to
+            // --background. Force both to solid black so the bars are #000000
+            // whichever VO mpv auto-selects.
+            args.push("--background=color".into());
+            args.push("--border-background=color".into());
+            args.push("--background-color=#000000".into());
             // Only let mpv's ytdl hook resolve when we handed it a page URL.
             if !direct {
                 args.push("--ytdl-format=bestvideo+bestaudio/best".into());
@@ -348,6 +357,10 @@ mod tests {
         );
         assert!(a.iter().any(|s| s == "--ytdl-format=bestvideo+bestaudio/best"));
         assert!(a.iter().any(|s| s == "--demuxer-max-bytes=256MiB"));
+        // Letterbox bars forced to solid black (OLED), not the grey tile default.
+        assert!(a.iter().any(|s| s == "--background=color"));
+        assert!(a.iter().any(|s| s == "--border-background=color"));
+        assert!(a.iter().any(|s| s == "--background-color=#000000"));
         // Best-quality format selection is external-only, never embedded.
         let rect = CellRect { left: 0, top: 0, cols: 10, rows: 10, pixel_width: None, pixel_height: None };
         let e = build_args(

@@ -19,10 +19,14 @@ pub fn render(frame: &mut Frame, app: &App) {
     // paint because of aspect-ratio scaling) appear black rather than showing
     // the terminal background colour. Kitty images render above the text
     // layer, so this black fill doesn't interfere with the video itself.
+    // Use true-RGB black, NOT Color::Black: the latter is ANSI palette index 0,
+    // which themes may remap to a grey (e.g. omarchy vantablack sets palette 0 =
+    // #404040), so on an OLED the bars glow grey. Rgb(0,0,0) is always #000000.
     if app.view == View::Player && app.fullscreen {
         frame.render_widget(
-            ratatui::widgets::Block::default()
-                .style(ratatui::style::Style::default().bg(ratatui::style::Color::Black)),
+            ratatui::widgets::Block::default().style(
+                ratatui::style::Style::default().bg(ratatui::style::Color::Rgb(0, 0, 0)),
+            ),
             area,
         );
         return;
